@@ -1,0 +1,88 @@
+# Mamformer Ultra 37B Configuration
+# ~200B total / ~37B active | 128K context | 32K output
+#
+# Mid-tier: Enterprise-scale model with 37B active parameters.
+# Same active compute as DeepSeek V3, 200B total via MoE.
+
+model:
+  name: "Mamformer-Ultra-37B"
+  description: "~200B total / ~37B active | 128K context | 32K output"
+
+  d_model: 6144
+  n_layers: 40
+  n_heads: 48
+  n_kv_heads: 8
+  head_dim: 128
+  d_ff: 12288
+  vocab_size: 128000
+  max_seq_len: 131072           # 128K
+  tie_word_embeddings: true
+
+  use_sliding_window: true
+  sliding_window: 16384         # 16K sliding window
+
+  mamba:
+    expand: 1
+    d_state: 128
+    d_conv: 4
+    dt_rank: "auto"
+
+  moe:
+    enabled: true
+    n_shared_experts: 2
+    shared_expert_intermediate_dim: 3072
+    n_routed_experts: 256
+    top_k: 8
+    expert_intermediate_dim: 768
+    router_temperature: 1.0
+    aux_loss_free: true
+    bias_update_speed: 0.001
+
+  dsa:
+    enabled: true
+    lambda_init: 0.8
+    use_state_injection: true
+    state_injection_dim: 64
+
+  mtp:
+    enabled: true
+    depth: 2
+    loss_weight: 0.3
+
+  rope:
+    theta: 10000000.0           # 10M theta for 128K
+    use_yarn: true
+    yarn_scale: 16.0            # 8192 × 16 = 131K
+    yarn_original_max_seq_len: 8192
+
+  generation:
+    max_context: 131072
+    max_output_tokens: 32768
+    default_temperature: 0.7
+    default_top_k: 50
+    default_top_p: 0.9
+
+  dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  initializer_range: 0.01
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 12
+  learning_rate: 2.0e-4
+  weight_decay: 0.1
+  warmup_steps: 3000
+  max_steps: 150000
+  max_seq_len: 131072
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: true

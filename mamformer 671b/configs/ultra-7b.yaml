@@ -1,0 +1,93 @@
+# Mamformer Ultra 7B Configuration
+# Goal: Surpass DeepSeek V3 performance at 7B active / ~50B total parameters
+#
+# Key innovations:
+#   - DeepSeekMoE: 2 shared + 128 routed experts (top-8), aux-loss-free load balancing
+#   - DSA: Differential State-Aware Attention with Mamba state injection
+#   - MTP: Multi-Token Prediction (depth=2) for denser training signal
+#
+# Active parameters: ~7.2B (same inference cost as dense 7B)
+# Total parameters:  ~52B (7x capacity multiplier via MoE)
+
+model:
+  name: "Mamformer-Ultra-7b"
+  d_model: 4096
+  n_layers: 32
+  n_heads: 32          # Query heads (GQA)
+  n_kv_heads: 8        # Key/Value heads (GQA)
+  head_dim: 128
+  d_ff: 9216           # Base FFN dimension (MoE active dim matches this)
+  vocab_size: 128000
+  max_seq_len: 8192
+  tie_word_embeddings: true
+
+  # Sliding Window Attention (like Mistral-7B)
+  sliding_window: 4096
+  use_sliding_window: true
+
+  # Mamba-2 SSM settings (enhanced)
+  mamba:
+    expand: 2           # Double inner dimension for stronger SSM
+    d_state: 128        # SSM state dimension
+    d_conv: 4           # 1D convolution kernel size
+    dt_rank: "auto"     # auto = ceil(d_model / 16) = 256
+
+  # DeepSeekMoE: Sparse Mixture of Experts
+  moe:
+    enabled: true
+    n_shared_experts: 2                # Always-active common knowledge experts
+    shared_expert_intermediate_dim: 2304  # Hidden dim per shared expert
+    n_routed_experts: 128              # Total sparse experts (fine-grained)
+    top_k: 8                           # Experts activated per token
+    expert_intermediate_dim: 576       # Hidden dim per routed expert
+    router_temperature: 1.0            # No temperature scaling initially
+    aux_loss_free: true                # DeepSeek V3 style bias-based balancing
+    bias_update_speed: 0.001           # β for bias adjustment
+
+  # DSA: Differential State-Aware Attention
+  dsa:
+    enabled: true
+    lambda_init: 0.8                   # λ = exp(0.8) ≈ 2.23 initial noise cancellation
+    use_state_injection: true          # Inject Mamba state into K/V
+    state_injection_dim: 64            # Bottleneck dimension for state injection
+
+  # MTP: Multi-Token Prediction
+  mtp:
+    enabled: true
+    depth: 2                           # Predict 2 additional future tokens
+    loss_weight: 0.3                   # α for MTP auxiliary loss
+    mtp_d_model: 0                     # 0 = share d_model with main model
+
+  # RoPE settings
+  rope:
+    theta: 1000000.0    # Increased for better long-context extrapolation
+    use_yarn: true
+
+  # Regularization
+  dropout: 0.0
+  rms_norm_eps: 1e-6
+
+  # Initialization
+  initializer_range: 0.02
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 2.0e-4   # Slightly lower LR for MoE stability
+  weight_decay: 0.1
+  warmup_steps: 2000
+  max_steps: 100000
+  max_seq_len: 8192
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+  # FSDP settings (critical for 50B+ total params)
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: true    # Enable CPU offload for 50B+ model

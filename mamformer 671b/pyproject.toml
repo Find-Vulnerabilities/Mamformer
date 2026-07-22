@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Mamformer"
+version = "0.1.0"
+description = "Mamba-2 + Transformer Hybrid LLM (7B) — Research Platform"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "AI Research Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "transformers>=4.40.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.65.0",
+    "numpy>=1.24.0",
+]
+[project.optional-dependencies]
+train = [
+    "datasets>=2.14.0",
+    "accelerate>=0.24.0",
+    "wandb>=0.15.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
+]
+all = [
+    "Mamformer[train,dev]",
+]
+
+[project.scripts]
+Mamformer-generate = "Mamformer.cli:generate"
+Mamformer-train = "Mamformer.cli:train"
+
+[tool.setuptools.packages.find]
+include = ["Mamformer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

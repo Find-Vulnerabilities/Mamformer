@@ -1,0 +1,55 @@
+# Mamformer 7B Model Configuration
+# Mamba-2 + Transformer Hybrid LLM
+
+model:
+  name: "Mamformer-7b"
+  d_model: 4096
+  n_layers: 32
+  n_heads: 32          # Query heads (GQA)
+  n_kv_heads: 8        # Key/Value heads (GQA)
+  head_dim: 128
+  d_ff: 9216           # SwiGLU intermediate dimension
+  vocab_size: 128000
+  max_seq_len: 8192
+  tie_word_embeddings: true
+
+  # Mamba-2 SSM settings
+  mamba:
+    expand: 1          # Channel expansion factor (d_inner = expand * d_model)
+    d_state: 128       # SSM state dimension
+    d_conv: 4          # 1D convolution kernel size
+    dt_rank: "auto"    # auto = ceil(d_model / 16)
+
+  # RoPE settings
+  rope:
+    theta: 10000.0
+    use_yarn: false
+
+  # Regularization
+  dropout: 0.0
+  rms_norm_eps: 1e-6
+
+  # Initialization
+  initializer_range: 0.02
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 3.0e-4
+  weight_decay: 0.1
+  warmup_steps: 2000
+  max_steps: 100000
+  max_seq_len: 8192
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+  # FSDP settings
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: false

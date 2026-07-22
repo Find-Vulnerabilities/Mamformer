@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/ -x -q)",
+      "Bash(python -m pytest tests/ -q)",
+      "Bash(python -m pytest tests/ -q --tb=short)",
+      "Bash(python -m pytest tests/test_model.py::TestMamformerForCausalLM::test_greedy_generation -v --tb=long)",
+      "Bash(python -m pytest tests/ -q --tb=line)"
+    ]
+  }
+}

@@ -1,0 +1,115 @@
+# ======================================================================
+#   Mamformer Ultra 671B — MAX CONFIGURATION
+#   Target: Surpass DeepSeek V3 at 671B scale
+# ======================================================================
+#
+# Architecture:
+#   - 52 hybrid layers (Mamba-2 + DSA attention)
+#   - DeepSeekMoE: 2 shared + 640 routed experts (top-8)
+#   - Multi-Token Prediction (depth=2)
+#   - YaRN: 128x scaling for 1M context window
+#   - Sliding window attention (32K window)
+#
+# Key metrics:
+#   - Total params:   ~671B
+#   - Active params:  ~37B (per token, same as DeepSeek V3)
+#   - Context:        1,048,576 tokens (1M)
+#   - Max output:     163,800 tokens
+#   - Expansion:      ~18x (total / active)
+
+model:
+  name: "Mamformer-Ultra-671B"
+  description: "671B total / 37B active | 1M context | 163K output [MAX]"
+
+  # ── Core dimensions ────────────────────────────────────────────
+  d_model: 7168
+  n_layers: 52
+  n_heads: 56
+  n_kv_heads: 8
+  head_dim: 128
+  d_ff: 14336
+  vocab_size: 128000
+  max_seq_len: 1048576      # 1M tokens
+  tie_word_embeddings: true
+
+  # ── Long context support ───────────────────────────────────────
+  use_sliding_window: true
+  sliding_window: 32768      # 32K local window for attention
+                              # Mamba-2 handles long-range via SSM
+
+  # ── Enhanced Mamba-2 SSM ───────────────────────────────────────
+  mamba:
+    expand: 1                # d_inner = d_model (keeps active params low)
+    d_state: 128             # SSM state dimension
+    d_conv: 4                # Causal conv kernel
+    dt_rank: "auto"          # ceil(7168/16) = 448
+
+  # ── DeepSeekMoE: 512 fine-grained experts ──────────────────────
+  moe:
+    enabled: true
+    n_shared_experts: 2
+    shared_expert_intermediate_dim: 3584   # 2 × 3 × 7168 × 3584 params
+    n_routed_experts: 640                  # Massive expert pool
+    top_k: 8                               # Activate 8 per token
+    expert_intermediate_dim: 896           # 512 × 3 × 7168 × 896 = ~9.9B per layer
+    router_temperature: 1.0
+    aux_loss_free: true                    # DeepSeek V3 style
+    bias_update_speed: 0.001
+
+  # ── DSA: Differential State-Aware Attention ────────────────────
+  dsa:
+    enabled: true
+    lambda_init: 0.8
+    use_state_injection: true
+    state_injection_dim: 64
+
+  # ── MTP: Multi-Token Prediction ────────────────────────────────
+  mtp:
+    enabled: true
+    depth: 2
+    loss_weight: 0.3
+
+  # ── YaRN: 128x context scaling (8K → 1M) ──────────────────────
+  rope:
+    theta: 50000000.0        # Massive theta for 1M context
+    use_yarn: true
+    yarn_scale: 128.0        # 8192 × 128 = 1,048,576
+    yarn_original_max_seq_len: 8192
+    yarn_beta_fast: 32
+    yarn_beta_slow: 1
+
+  # ── Generation defaults ────────────────────────────────────────
+  generation:
+    max_context: 1048576
+    max_output_tokens: 163800
+    default_temperature: 0.7
+    default_top_k: 50
+    default_top_p: 0.9
+
+  # ── Regularization ─────────────────────────────────────────────
+  dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  initializer_range: 0.006    # Smaller init for larger model
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 16    # More accumulation for 671B
+  learning_rate: 1.5e-4             # Lower LR for stability
+  weight_decay: 0.1
+  warmup_steps: 4000                # Longer warmup
+  max_steps: 200000
+  max_seq_len: 1048576
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  max_grad_norm: 0.5               # Tighter clipping for MoE
+
+  # FSDP: essential for 671B model
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: true               # Must CPU-offload for 671B

@@ -1,0 +1,30 @@
+# Mamformer Data Mix Configuration
+# ==================================
+# Controls the domain distribution and quality thresholds
+# for the training data pipeline.
+#
+# Higher weight = more tokens from that domain.
+# Weights should sum to 1.0.
+
+# ── Domain Weights ──────────────────────────────────────
+weights:
+  web: 0.35           # General web content (CommonCrawl, C4, etc.)
+  code: 0.20          # Programming code (GitHub, StackOverflow)
+  wiki: 0.12          # Encyclopedia content (Wikipedia)
+  books: 0.10         # Long-form books (Gutenberg, Books3)
+  science: 0.08       # Scientific papers (arXiv, PubMed)
+  math: 0.07          # Mathematical content (proofs, problems)
+  conversation: 0.05  # Dialogues, chats, Q&A
+  other: 0.03         # Uncategorized content
+
+# ── Quality Thresholds ───────────────────────────────────
+min_doc_length: 50         # Minimum characters per document
+max_doc_length: 100000     # Maximum characters per document
+min_quality_score: 0.3     # Minimum quality score (0-1)
+dedup_threshold: 0.8       # Jaccard similarity for near-dedup
+
+# ── Target Size ─────────────────────────────────────────
+target_total_tokens: 2000000000000  # 2 trillion tokens
+
+# ── Shuffling ───────────────────────────────────────────
+shuffle_seed: 42

@@ -1,0 +1,53 @@
+# Mamformer Ultra 671B — 64 GPU 4D Parallel Training Config
+# ============================================================
+# DP=2, TP=4, PP=4, EP=2 → 2x4x4x2 = 64 GPUs
+#
+# GPU Layout (8 nodes x 8 GPUs):
+#   Node 0: [TP group 0, PP stages 0-1, EP groups 0-1] x DP 0
+#   Node 1: [TP group 0, PP stages 2-3, EP groups 0-1] x DP 0
+#   Node 2: [TP group 1, PP stages 0-1, EP groups 0-1] x DP 0
+#   Node 3: [TP group 1, PP stages 2-3, EP groups 0-1] x DP 0
+#   Nodes 4-7: Same layout for DP 1
+#
+# Per-GPU memory estimate (BF16):
+#   - Model params (local): ~10.5B x 2 bytes = ~21 GB (with TP+PP+EP)
+#   - Optimizer states (Adam): ~21 GB x 2 = ~42 GB
+#   - Activations (with grad ckpt): ~8 GB
+#   - Total: ~71 GB → requires 80GB GPU (A100/H100)
+#
+# With FSDP + CPU offload:
+#   - Model params (local): ~21 GB
+#   - Optimizer (CPU offload): ~0 GB GPU
+#   - Activations: ~8 GB
+#   - Total: ~29 GB → fits on 40GB A100
+
+parallelism:
+  dp: 2      # Data parallel replicas
+  tp: 4      # Tensor parallel (within node, NVLink)
+  pp: 4      # Pipeline parallel (13 layers per stage for 52-layer model)
+  ep: 2      # Expert parallel (320 experts per rank for 640-expert model)
+
+training:
+  batch_size: 1               # Micro-batch per GPU
+  gradient_accumulation_steps: 16   # Effective batch = 1 x 16 x 2(DP) = 32
+  learning_rate: 1.5e-4
+  weight_decay: 0.1
+  warmup_steps: 4000
+  max_steps: 200000
+  max_seq_len: 1048576        # 1M context (use 8192-32768 for initial training)
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+  max_grad_norm: 0.5
+
+# Launch command:
+# torchrun --nnodes=8 --nproc_per_node=8 \
+#   scripts/train_distributed.py \
+#   --config configs/ultra-671b-max.yaml \
+#   --data /path/to/tokenized/data \
+#   --dp 2 --tp 4 --pp 4 --ep 2 \
+#   --bf16 --use_wandb

@@ -1,0 +1,88 @@
+# Mamformer Ultra 371B Configuration
+# ~371B total / ~28B active | 256K context | 65K output
+#
+# High-tier: Between 37B and 671B scales.
+# 384 fine-grained routed experts with 256K context window.
+
+model:
+  name: "Mamformer-Ultra-371B"
+  description: "371B total / 28B active | 256K context | 65K output"
+
+  d_model: 7168
+  n_layers: 46
+  n_heads: 56
+  n_kv_heads: 8
+  head_dim: 128
+  d_ff: 14336
+  vocab_size: 128000
+  max_seq_len: 262144           # 256K
+  tie_word_embeddings: true
+
+  use_sliding_window: true
+  sliding_window: 16384         # 16K sliding window
+
+  mamba:
+    expand: 1
+    d_state: 128
+    d_conv: 4
+    dt_rank: "auto"
+
+  moe:
+    enabled: true
+    n_shared_experts: 2
+    shared_expert_intermediate_dim: 3584
+    n_routed_experts: 384
+    top_k: 8
+    expert_intermediate_dim: 896
+    router_temperature: 1.0
+    aux_loss_free: true
+    bias_update_speed: 0.001
+
+  dsa:
+    enabled: true
+    lambda_init: 0.8
+    use_state_injection: true
+    state_injection_dim: 64
+
+  mtp:
+    enabled: true
+    depth: 2
+    loss_weight: 0.3
+
+  rope:
+    theta: 20000000.0           # 20M theta for 256K
+    use_yarn: true
+    yarn_scale: 32.0            # 8192 x 32 = 262K
+    yarn_original_max_seq_len: 8192
+
+  generation:
+    max_context: 262144
+    max_output_tokens: 65536
+    default_temperature: 0.7
+    default_top_k: 50
+    default_top_p: 0.9
+
+  dropout: 0.0
+  rms_norm_eps: 1.0e-6
+  initializer_range: 0.008
+
+training:
+  batch_size: 1
+  gradient_accumulation_steps: 12
+  learning_rate: 1.8e-4
+  weight_decay: 0.1
+  warmup_steps: 3500
+  max_steps: 150000
+  max_seq_len: 262144
+  lr_schedule: "cosine"
+  optimizer: "adamw"
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+  fsdp:
+    enabled: true
+    sharding_strategy: "FULL_SHARD"
+    cpu_offload: true

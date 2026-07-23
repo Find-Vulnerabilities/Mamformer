@@ -6,7 +6,9 @@
       "Bash(python -m pytest tests/ -q)",
       "Bash(python -m pytest tests/ -q --tb=short)",
       "Bash(python -m pytest tests/test_model.py::TestMamformerForCausalLM::test_greedy_generation -v --tb=long)",
-      "Bash(python -m pytest tests/ -q --tb=line)"
+      "Bash(python -m pytest tests/ -q --tb=line)",
+      "Bash(python scripts/test_all.py)",
+      "Bash(USE_LIBUV=0 python -m torch.distributed.run --nproc_per_node=2 scripts/test_all.py)"
     ]
   }
 }

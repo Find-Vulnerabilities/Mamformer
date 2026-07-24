@@ -297,6 +297,9 @@ class PipelineScheduler1F1B:
         # ── Cooldown: finish remaining backwards ───────────────────
         while fwd_queue:
             mb_id, _, hs = fwd_queue.popleft()
+            # Non-last stages: wait for backward signal from next stage
+            if not self.stage.is_last:
+                self._recv_backward(mb_id)
             loss_with_grad = self.stage.compute_loss(hs, mbs_labels[mb_id])
             loss_with_grad.backward()
             if not self.stage.is_first:
@@ -308,47 +311,40 @@ class PipelineScheduler1F1B:
         return None
 
     def _send_forward(self, tensor: torch.Tensor, mb_idx: int):
-        """Send hidden states to next pipeline stage with shape metadata."""
+        """Send hidden states to next pipeline stage. Ordering-based protocol (no tags — NCCL compatible)."""
         if self.pp_group is not None and dist.is_initialized():
             dst = self.rank + 1
-            # Send shape metadata first
+            # Ordering guarantee: shape → data, sender matches receiver order
             shape_tensor = torch.tensor(tensor.shape, dtype=torch.long, device=tensor.device)
-            dist.send(shape_tensor, dst, tag=mb_idx * 2, group=self.pp_group)
-            # Send data
-            dist.send(tensor.contiguous(), dst, tag=mb_idx * 2 + 1, group=self.pp_group)
+            dist.send(shape_tensor, dst, group=self.pp_group)
+            dist.send(tensor.contiguous(), dst, group=self.pp_group)
 
     def _recv_forward(self, mb_size: int, seq_len: int, d_model: int) -> torch.Tensor:
-        """Receive hidden states from previous pipeline stage with shape negotiation."""
+        """Receive hidden states from previous pipeline stage. Matches _send_forward ordering."""
         if self.pp_group is not None and dist.is_initialized():
             src = self.rank - 1
-            # Receive shape metadata first (tag matches _send_forward: mb_idx*2)
             shape_tensor = torch.empty(3, dtype=torch.long, device=torch.cuda.current_device())
-            # The sender sends shape with tag=mb_idx*2, data with tag=mb_idx*2+1
-            # NCCL doesn't support tags, so we rely on ordering: shape always before data
             dist.recv(shape_tensor, src, group=self.pp_group)
             recv_batch, recv_seq, recv_d = shape_tensor.tolist()
-            # Receive data
-            tensor = torch.empty(recv_batch, recv_seq, recv_d, device=torch.cuda.current_device(), dtype=torch.float32)
+            tensor = torch.empty(recv_batch, recv_seq, recv_d,
+                                device=torch.cuda.current_device(), dtype=torch.float32)
             dist.recv(tensor, src, group=self.pp_group)
             return tensor
-        # Single-process fallback
         return torch.empty(mb_size, seq_len, d_model, device=torch.cuda.current_device())
 
     def _send_backward(self, mb_idx: int):
-        """Send gradient signals to previous pipeline stage for synchronization."""
+        """Send gradient completion signal to previous stage for 1F1B synchronization."""
         if self.pp_group is not None and dist.is_initialized():
             dst = self.rank - 1
-            # Send a completion signal so the previous stage knows backward is done
-            # This prevents deadlocks in the 1F1B schedule
             signal = torch.tensor([mb_idx], dtype=torch.long, device=torch.cuda.current_device())
-            dist.send(signal, dst, tag=mb_idx * 2 + 10000, group=self.pp_group)
+            dist.send(signal, dst, group=self.pp_group)
 
     def _recv_backward(self, mb_idx: int):
-        """Receive gradient completion signal from next pipeline stage."""
+        """Receive gradient completion signal from next stage."""
         if self.pp_group is not None and dist.is_initialized():
             src = self.rank + 1
             signal = torch.empty(1, dtype=torch.long, device=torch.cuda.current_device())
-            dist.recv(signal, src, tag=mb_idx * 2 + 10000, group=self.pp_group)
+            dist.recv(signal, src, group=self.pp_group)
 
 
 # ═══════════════════════════════════════════════════════════════════════

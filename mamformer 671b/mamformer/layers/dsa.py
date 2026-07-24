@@ -123,25 +123,30 @@ class DifferentialStateAttention(nn.Module):
         self.o_proj = nn.Linear(n_heads * head_dim, d_model, bias=False)
 
         # ── Differential attention lambda ───────────────────────────
-        # λ = exp(λ_log), initialized to exp(lambda_init)
-        # Per-head learnable parameter
-        self.lambda_log = nn.Parameter(
-            torch.ones(n_heads) * lambda_init
+        # λ = σ(λ_raw), clamped to [0, 0.99] for stability
+        # lambda_init is the target λ value (e.g., 0.8 → σ⁻¹(0.8) ≈ 1.386)
+        init_val = math.log(lambda_init / (1.0 - lambda_init)) if 0 < lambda_init < 1 else 0.0
+        self.lambda_raw = nn.Parameter(
+            torch.full((n_heads,), init_val)
         )
 
         # ── State injection (Mamba SSM → Attention K/V) ─────────────
         if use_state_injection:
-            # Project SSM state to a bottleneck, then expand to K/V space
+            # Legacy: project d_model → bottleneck → K/V space (for cached inference)
             self.state_k_proj = nn.Sequential(
-                nn.Linear(d_model, state_injection_dim, bias=False),  # Compress
+                nn.Linear(d_model, state_injection_dim, bias=False),
                 nn.SiLU(),
-                nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False),  # Expand to K
+                nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False),
             )
             self.state_v_proj = nn.Sequential(
-                nn.Linear(d_model, state_injection_dim, bias=False),  # Compress
+                nn.Linear(d_model, state_injection_dim, bias=False),
                 nn.SiLU(),
-                nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False),  # Expand to V
+                nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False),
             )
+            # Per-timestep: project h_states (d_state-dim) → K/V space directly
+            # h_states comes from SSM with shape (batch, seqlen, d_state)
+            self.h_state_k_proj = nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False)
+            self.h_state_v_proj = nn.Linear(state_injection_dim, n_kv_heads * head_dim, bias=False)
 
         # ── GroupNorm for stability (as in Differential Transformer) ─
         # Applied per-head after differential combination
@@ -172,10 +177,12 @@ class DifferentialStateAttention(nn.Module):
 
         if self.use_state_injection:
             # Smaller init for state injection (start near identity)
-            for module in [self.state_k_proj, self.state_v_proj]:
-                for layer in module:
+            for proj in [self.state_k_proj, self.state_v_proj]:
+                for layer in proj:
                     if isinstance(layer, nn.Linear):
                         nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+            nn.init.normal_(self.h_state_k_proj.weight, mean=0.0, std=0.01)
+            nn.init.normal_(self.h_state_v_proj.weight, mean=0.0, std=0.01)
 
     def forward(
         self,
@@ -183,7 +190,8 @@ class DifferentialStateAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         cache: Optional[dict] = None,
-        ssm_state: Optional[torch.Tensor] = None,  # NEW: Mamba SSM state
+        ssm_state: Optional[torch.Tensor] = None,
+        h_states: Optional[torch.Tensor] = None,  # Per-timestep SSM summaries (batch, seqlen, d_state)
     ) -> tuple[torch.Tensor, Optional[dict]]:
         """
         Forward pass for Differential State-Aware Attention.
@@ -194,7 +202,10 @@ class DifferentialStateAttention(nn.Module):
             use_cache: If True, return updated KV cache
             cache: Optional KV cache dict with 'k' and 'v' keys
             ssm_state: Optional Mamba-2 SSM state (batch, d_inner, d_state)
-                       When provided, injects state info into K and V
+                       (legacy: only used during cached inference)
+            h_states: Per-timestep SSM state summaries (batch, seqlen, d_state).
+                       When provided, injects state info into K and V per position.
+                       This is the primary path during training.
 
         Returns:
             (output, cache) — output shape (batch, seq_len, d_model)
@@ -208,30 +219,33 @@ class DifferentialStateAttention(nn.Module):
         v = self.v_proj(x)
 
         # ── Mamba State Injection ─────────────────────────────────
-        if self.use_state_injection and ssm_state is not None:
-            # ssm_state: (batch, d_inner, d_state)
-            # We use the mean over d_state as a summary
-            state_summary = ssm_state.mean(dim=-1)  # (batch, d_inner)
-            # If d_inner != d_model, project (should match in Mamformer)
-            if state_summary.shape[-1] != self.d_model:
-                # Pad or truncate
-                if state_summary.shape[-1] < self.d_model:
-                    pad = torch.zeros(
-                        batch_size, self.d_model - state_summary.shape[-1],
-                        device=x.device, dtype=x.dtype,
-                    )
-                    state_summary = torch.cat([state_summary, pad], dim=-1)
-                else:
-                    state_summary = state_summary[..., : self.d_model]
+        if self.use_state_injection:
+            if h_states is not None:
+                # Per-timestep state injection (primary training path)
+                # h_states: (batch, seqlen, d_state) → project to K/V space per position
+                # Use h_state_k_proj / h_state_v_proj (Linear(state_injection_dim → kv_dim))
+                # NOT state_k_proj / state_v_proj (which expect d_model input for legacy path)
+                k_inj = self._compute_state_injection(h_states, self.h_state_k_proj)
+                v_inj = self._compute_state_injection(h_states, self.h_state_v_proj)
+                k = k + k_inj
+                v = v + v_inj
+            elif ssm_state is not None:
+                # Legacy path: cached inference with (batch, d_inner, d_state)
+                state_summary = ssm_state.mean(dim=-1)  # (batch, d_inner)
+                if state_summary.shape[-1] != self.d_model:
+                    if state_summary.shape[-1] < self.d_model:
+                        pad = torch.zeros(
+                            batch_size, self.d_model - state_summary.shape[-1],
+                            device=x.device, dtype=x.dtype,
+                        )
+                        state_summary = torch.cat([state_summary, pad], dim=-1)
+                    else:
+                        state_summary = state_summary[..., : self.d_model]
 
-            # Need to replicate state across sequence positions
-            # For training: use a learned projection
-            k_state = self.state_k_proj(state_summary)  # (batch, n_kv_heads * head_dim)
-            v_state = self.state_v_proj(state_summary)
-
-            # Add to K and V (broadcast across seq_len)
-            k = k + k_state.unsqueeze(1)
-            v = v + v_state.unsqueeze(1)
+                k_state = self.state_k_proj(state_summary)  # (batch, n_kv_heads * head_dim)
+                v_state = self.state_v_proj(state_summary)
+                k = k + k_state.unsqueeze(1)
+                v = v + v_state.unsqueeze(1)
 
         # ── Reshape to (batch, n_heads, seq_len, head_dim) ─────────
         q1 = q1.view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
@@ -276,14 +290,15 @@ class DifferentialStateAttention(nn.Module):
             kv_len = k.shape[2]
             q_len = q1.shape[2]
             causal_mask = torch.triu(
-                torch.full((q_len, kv_len), float("-inf"), device=x.device, dtype=attn_logits_1.dtype),
+                torch.full((q_len, kv_len), torch.finfo(attn_logits_1.dtype).min,
+                          device=x.device, dtype=attn_logits_1.dtype),
                 diagonal=kv_len - q_len + 1,
             ).unsqueeze(0).unsqueeze(0)
             attn_logits_1 = attn_logits_1 + causal_mask
             attn_logits_2 = attn_logits_2 + causal_mask
 
         # Compute lambda (per head), clamped for stability
-        lam_raw = torch.exp(self.lambda_log).view(1, self.n_heads, 1, 1)
+        lam_raw = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
         lam = torch.clamp(lam_raw, max=0.99)
 
         # Differential softmax combination with (1-lambda) normalization
@@ -311,6 +326,26 @@ class DifferentialStateAttention(nn.Module):
 
         return output, new_cache
 
+    def _compute_state_injection(
+        self, h_states: torch.Tensor, proj: nn.Module
+    ) -> torch.Tensor:
+        """
+        Project per-timestep SSM h-states to K/V injection values.
+
+        h_states: (batch, seqlen, d_state) — SSM state summaries per position
+        Returns: (batch, seqlen, n_kv_heads * head_dim) — additive injection
+        """
+        batch, seqlen, d_state = h_states.shape
+        # h_states has d_state dims; pad/trim to state_injection_dim for projection
+        flat = h_states.reshape(batch * seqlen, d_state)
+        target_dim = self.state_injection_dim
+        if d_state < target_dim:
+            flat = torch.nn.functional.pad(flat, (0, target_dim - d_state))
+        elif d_state > target_dim:
+            flat = flat[:, :target_dim]
+        # Project to K/V space
+        return proj(flat).view(batch, seqlen, -1)
+
     def get_lambda_values(self) -> torch.Tensor:
         """
         Return current λ values for analysis.
@@ -318,7 +353,7 @@ class DifferentialStateAttention(nn.Module):
         Returns:
             Tensor of shape (n_heads,) with positive λ values
         """
-        return torch.exp(self.lambda_log).detach()
+        return torch.sigmoid(self.lambda_raw).detach()
 
     def extra_repr(self) -> str:
         sw_info = f", sliding_window={self.sliding_window}" if self.sliding_window > 0 else ""
@@ -327,6 +362,6 @@ class DifferentialStateAttention(nn.Module):
             f"d_model={self.d_model}, n_heads={self.n_heads}, "
             f"n_kv_heads={self.n_kv_heads}, head_dim={self.head_dim}, "
             f"n_head_groups={self.n_head_groups}, "
-            f"lambda_init={self.lambda_log[0].item():.2f}"
+            f"lambda_init={self.lambda_raw[0].item():.2f}"
             f"{sw_info}{si_info}"
         )

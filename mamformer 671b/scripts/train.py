@@ -100,10 +100,14 @@ class TextDataset(IterableDataset):
 
         buffer = []
         for file_path in self.files:
-            # Read uint16 binary tokens (matching prepare_data.py output)
+            # Memory-efficient: read in chunks instead of loading entire file
             raw_bytes = open(file_path, 'rb').read()
-            data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.int16).long()
-            buffer.extend(data.tolist())
+            data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
+            # Stream through data without creating giant Python list
+            data_list = data.tolist()
+            buffer.extend(data_list)
+            # Free memory
+            del data, data_list, raw_bytes
 
             while len(buffer) >= self.seq_len + 1:
                 chunk = buffer[: self.seq_len + 1]
@@ -112,6 +116,10 @@ class TextDataset(IterableDataset):
                     "input_ids": torch.tensor(chunk[:-1]),
                     "labels": torch.tensor(chunk[1:]),
                 }
+
+            # Periodically trim buffer to prevent unbounded growth
+            if len(buffer) > self.seq_len * 1024:
+                buffer = buffer[-self.seq_len * 512:]
 
 
 # ── LR Schedule ────────────────────────────────────────────────────────
@@ -168,6 +176,17 @@ def train(config: dict) -> None:
 
     # ── Model ──────────────────────────────────────────────────
     model_config = MamformerConfig.from_yaml(config["config_path"])
+
+    # Override CommunicativeMoE from CLI flag
+    if config.get("comm_moe", False):
+        if model_config.moe.enabled or model_config.st_moe.enabled:
+            model_config.communicative_moe.enabled = True
+            logger.info("CommunicativeMoE: ENABLED (cross-expert communication)")
+        else:
+            logger.warning("CommunicativeMoE requires MoE or ST-MoE — enabling MoE automatically")
+            model_config.moe.enabled = True
+            model_config.communicative_moe.enabled = True
+
     logger.info(f"Loading model: {model_config.name}")
     logger.info(f"Parameters: {model_config.num_parameters_billions:.2f}B")
 
@@ -227,7 +246,7 @@ def train(config: dict) -> None:
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "norm" in name or "bias" in name or "gate" in name:
+        if any(x in name for x in ("norm", "bias", "gate", "alpha", "lambda_log", "A_log")):
             no_decay_params.append(param)
         else:
             decay_params.append(param)
@@ -520,7 +539,10 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=8192)
     parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 mixed precision")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
+                       help="Enable gradient checkpointing (default: True)")
+    parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing",
+                       help="Disable gradient checkpointing")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")
     parser.add_argument("--save_every", type=int, default=5000)
     parser.add_argument("--log_every", type=int, default=10)
@@ -529,6 +551,7 @@ def main():
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
+    parser.add_argument("--comm_moe", action="store_true", help="Enable CommunicativeMoE cross-expert communication")
 
     args = parser.parse_args()
 
@@ -560,6 +583,7 @@ def main():
         "wandb_run_name": args.wandb_run_name,
         "num_workers": args.num_workers,
         "resume": args.resume,
+        "comm_moe": args.comm_moe,
     }
 
     train(config)

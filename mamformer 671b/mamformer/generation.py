@@ -332,8 +332,9 @@ class GenerationMixin:
             next_beam_indices = next_beam_indices.view(-1)
             next_token_indices = next_token_indices.view(-1)
 
-            # Reorder beams
+            # Reorder beams AND their KV caches
             generated = generated[next_beam_indices]
+            cache = self._reorder_cache(cache, next_beam_indices)
             generated = torch.cat([generated, next_token_indices.unsqueeze(-1)], dim=-1)
 
             # Check EOS
@@ -341,12 +342,13 @@ class GenerationMixin:
                 eos_mask = next_token_indices == config.eos_token_id
                 beam_scores = beam_scores.masked_fill(eos_mask, float("-inf"))
 
-            # Select top num_beams
+            # Select top num_beams AND reorder caches
             beam_scores = beam_scores.view(batch_size, -1)
             _, best_indices = torch.topk(beam_scores, num_beams, dim=-1)
             beam_scores = beam_scores.view(-1)[best_indices.view(-1)]
             best_indices = best_indices.view(-1)
             generated = generated[best_indices]
+            cache = self._reorder_cache(cache, best_indices)
 
             # End if all beams hit EOS
             if config.eos_token_id is not None:
@@ -356,6 +358,28 @@ class GenerationMixin:
         # Return best sequence for each batch item
         best_generated = generated.view(batch_size, num_beams, -1)[:, 0, :]
         return best_generated
+
+    @staticmethod
+    def _reorder_cache(cache, indices):
+        """Reorder cached KV+SSM states to match beam reordering."""
+        if cache is None:
+            return None
+        new_cache = []
+        for layer_cache in cache:
+            if layer_cache is None:
+                new_cache.append(None)
+                continue
+            new_layer = {}
+            for key, val in layer_cache.items():
+                if isinstance(val, dict):
+                    new_layer[key] = {k: v[indices] if v is not None else None
+                                     for k, v in val.items()}
+                elif isinstance(val, torch.Tensor):
+                    new_layer[key] = val[indices]
+                else:
+                    new_layer[key] = val
+            new_cache.append(new_layer)
+        return new_cache
 
     @torch.no_grad()
     def generate_stream(

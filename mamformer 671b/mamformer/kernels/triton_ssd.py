@@ -91,6 +91,10 @@ if is_triton_available():
         # Precompute D * x (skip connection)
         D_vals = tl.load(D_ptr + d_inner_offs, mask=d_inner_mask, other=0.0)
 
+        # Precompute A (constant across sequence)
+        A_exp = tl.load(A_ptr + d_state_offs, mask=d_state_mask, other=0.0).to(tl.float32)
+        A_exp = tl.exp(A_exp)
+
         for s in range(seq_len):
             # Load inputs at position s
             x_offs = (batch_idx * stride_x_b + s * stride_x_s
@@ -101,18 +105,15 @@ if is_triton_available():
                        + d_inner_start * stride_dt_d + tl.arange(0, BLOCK_SIZE))
             dt_s = tl.load(dt_ptr + dt_offs, mask=d_inner_mask, other=0.0).to(tl.float32)
 
-            # Load A (shared across sequence), B, C
-            A_s = tl.load(A_ptr + d_state_offs, mask=d_state_mask, other=0.0).to(tl.float32)
-            A_s = tl.exp(A_s)  # A_log → A
-
+            # Load B, C (A is precomputed above)
             B_offs = (batch_idx * stride_B_b + s * stride_B_s + d_state_offs)
             B_s = tl.load(B_ptr + B_offs, mask=d_state_mask, other=0.0).to(tl.float32)
 
             C_offs = (batch_idx * stride_C_b + s * stride_C_s + d_state_offs)
             C_s = tl.load(C_ptr + C_offs, mask=d_state_mask, other=0.0).to(tl.float32)
 
-            # Discretize: A_disc = exp(-A * dt)
-            A_disc = tl.exp(-A_s[None, :] * dt_s[:, None])  # (BLOCK_SIZE, STATE_BLOCK)
+            # Discretize: A_disc = exp(-A * dt) using precomputed A_exp
+            A_disc = tl.exp(-A_exp[None, :] * dt_s[:, None])  # (BLOCK_SIZE, STATE_BLOCK)
 
             # B_disc = B * dt
             B_disc = B_s[None, :] * dt_s[:, None]  # (BLOCK_SIZE, STATE_BLOCK)

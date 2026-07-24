@@ -35,7 +35,8 @@ def selective_scan(
     B: torch.Tensor,
     C: torch.Tensor,
     D: torch.Tensor,
-) -> torch.Tensor:
+    return_h_states: bool = False,
+):
     """
     Mamba-2 selective scan (SSD kernel) — pure PyTorch sequential implementation.
 
@@ -52,9 +53,14 @@ def selective_scan(
         B: Input-dependent state projection (batch, seqlen, d_state)
         C: Input-dependent output projection (batch, seqlen, d_state)
         D: Skip connection weight (d_inner,)
+        return_h_states: If True, also return per-timestep h-state summaries.
+                         h_states[t] = mean-pool over d_inner of h at step t.
+                         Shape: (batch, seqlen, d_state)
 
     Returns:
         y: Output tensor (batch, seqlen, d_inner)
+        h_states: (only if return_h_states=True)
+                  Per-timestep SSM state summaries (batch, seqlen, d_state)
     """
     batch, seqlen, d_inner = x.shape
     d_state = A.shape[0]
@@ -77,15 +83,25 @@ def selective_scan(
     h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
     y = torch.zeros(batch, seqlen, d_inner, device=x.device, dtype=x.dtype)
 
+    # Optional: collect per-timestep h summaries for Space-Time MoE
+    h_states = None
+    if return_h_states:
+        h_states = torch.zeros(batch, seqlen, d_state, device=x.device, dtype=x.dtype)
+
     for t in range(seqlen):
         # h_t = A_disc[t] * h_{t-1} + Bx[t]
         h = A_disc[:, t] * h + Bx[:, t]  # (batch, d_inner, d_state)
         # y_t = C[t]^T * h_t (dot product over d_state)
         y[:, t] = torch.sum(C[:, t].unsqueeze(1) * h, dim=-1)  # (batch, d_inner)
+        # Collect h-state summary: mean-pool over d_inner channels
+        if return_h_states:
+            h_states[:, t] = h.mean(dim=1)  # (batch, d_state)
 
     # Add skip connection
     y = y + D.view(1, 1, d_inner) * x
 
+    if return_h_states:
+        return y, h_states
     return y
 
 
@@ -96,12 +112,15 @@ def selective_scan_sequential(
     B: torch.Tensor,
     C: torch.Tensor,
     D: torch.Tensor,
-) -> torch.Tensor:
+    return_h_states: bool = False,
+):
     """
-    Sequential implementation of the selective scan (for testing/validation).
+    Sequential selective scan (for testing/validation of the SSD kernel).
+    Numerically equivalent to selective_scan() — O(seqlen), verifies correctness.
 
-    This is numerically equivalent to the parallel scan but runs
-    in O(seqlen) per call — useful for verifying correctness.
+    Returns:
+        y: (batch, seqlen, d_inner)
+        h_states: (batch, seqlen, d_state) if return_h_states=True
     """
     batch, seqlen, d_inner = x.shape
     d_state = A.shape[0]
@@ -113,21 +132,25 @@ def selective_scan_sequential(
     B_expanded = B.unsqueeze(2)
     B_disc = B_expanded * dt_expanded
 
-    # Sequential scan
     h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
     y = torch.zeros(batch, seqlen, d_inner, device=x.device, dtype=x.dtype)
+    h_states = torch.zeros(batch, seqlen, d_state, device=x.device, dtype=x.dtype) if return_h_states else None
 
     for t in range(seqlen):
-        A_t = A_disc[:, t]  # (batch, d_inner, d_state)
-        Bx_t = B_disc[:, t] * x[:, t].unsqueeze(-1)  # (batch, d_inner, d_state)
-        C_t = C[:, t].unsqueeze(1)  # (batch, 1, d_state)
+        A_t = A_disc[:, t]
+        Bx_t = B_disc[:, t] * x[:, t].unsqueeze(-1)
+        C_t = C[:, t].unsqueeze(1)
 
-        h = A_t * h + Bx_t  # (batch, d_inner, d_state)
-        y[:, t] = (C_t * h).sum(dim=-1)  # (batch, d_inner)
+        h = A_t * h + Bx_t
+        y[:, t] = (C_t * h).sum(dim=-1)
+        if return_h_states:
+            h_states[:, t] = h.mean(dim=1)
 
     D_expanded = D.view(1, 1, d_inner)
     y = y + D_expanded * x
 
+    if return_h_states:
+        return y, h_states
     return y
 
 
@@ -230,7 +253,8 @@ class Mamba2Block(nn.Module):
         u: torch.Tensor,
         use_cache: bool = False,
         cache: Optional[dict] = None,
-    ) -> tuple[torch.Tensor, Optional[dict]]:
+        return_h_states: bool = False,
+    ):
         """
         Forward pass for the Mamba-2 block.
 
@@ -238,9 +262,12 @@ class Mamba2Block(nn.Module):
             u: Input tensor (batch, seqlen, d_model)
             use_cache: If True, returns SSM state cache
             cache: Optional dict with 'conv_state' and 'ssm_state' for recurrent inference
+            return_h_states: If True, also return per-timestep SSM state summaries
+                             for Space-Time MoE routing. Shape: (batch, seqlen, d_state)
 
         Returns:
             (output, cache) — output shape (batch, seqlen, d_model)
+            (output, cache, h_states) — if return_h_states=True
         """
         batch, seqlen, _ = u.shape
 
@@ -260,13 +287,19 @@ class Mamba2Block(nn.Module):
         C = self.C_proj(x_act)  # (batch, seqlen, d_state)
 
         # Selective scan (SSD kernel) with proper state caching
+        h_states = None
+        new_ssm_state = None
         if use_cache and cache is not None and cache.get("ssm_state") is not None:
-            y = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
-            new_ssm_state = None  # Will be set below after computing h_t
+            y, new_ssm_state = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
         else:
-            y = selective_scan(
+            scan_result = selective_scan(
                 x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
+                return_h_states=return_h_states,
             )
+            if return_h_states:
+                y, h_states = scan_result
+            else:
+                y = scan_result
 
         # Gate: z after SiLU
         z_gate = F.silu(z)
@@ -278,30 +311,30 @@ class Mamba2Block(nn.Module):
         # Build cache with correct conv_state and ssm_state preservation
         new_cache = None
         if use_cache:
-            # Compute current SSM state from the last position
-            if seqlen > 1:
-                new_conv_state = x[:, -self.d_conv + 1:]
-                # Compute SSM state at last position for next step
-                dt_last = dt[:, -1:]  # (batch, 1, d_inner)
-                B_last = B[:, -1:]    # (batch, 1, d_state)
-                x_last = x_act[:, -1:]  # (batch, 1, d_inner)
-                A_param = torch.exp(self.A_log)
-                A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
-                B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
-                h_last = B_disc_last * x_last.unsqueeze(-1)  # (batch, 1, d_inner, d_state)
-                new_ssm_state = h_last[:, 0]  # (batch, d_inner, d_state)
-            else:
-                new_conv_state = x[:, -self.d_conv + 1:] if x.shape[1] >= self.d_conv else x
-                if cache is not None and "conv_state" in cache:
-                    # Extend existing conv state for single-token inference
-                    new_conv_state = torch.cat([cache["conv_state"], new_conv_state], dim=1)[:, -self.d_conv + 1:]
-                new_ssm_state = None
+            # Compute SSM state at the last position for next step
+            # Always compute it, regardless of seqlen
+            dt_last = dt[:, -1:]  # (batch, 1, d_inner)
+            B_last = B[:, -1:]    # (batch, 1, d_state)
+            x_last = x_act[:, -1:]  # (batch, 1, d_inner)
+            A_param = torch.exp(self.A_log)
+            A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
+            B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
+            new_ssm_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]  # (batch, d_inner, d_state)
+
+            # Compute conv state (last d_conv-1 positions of x before activation)
+            conv_x = x[:, -(self.d_conv - 1):] if x.shape[1] >= self.d_conv else x
+            if cache is not None and "conv_state" in cache:
+                # Extend existing conv state for single-token inference
+                conv_x = torch.cat([cache["conv_state"], conv_x], dim=1)[:, -(self.d_conv - 1):]
+            new_conv_state = conv_x
 
             new_cache = {
                 "conv_state": new_conv_state,
                 "ssm_state": new_ssm_state,
             }
 
+        if return_h_states:
+            return out, new_cache, h_states
         return out, new_cache
 
     def _causal_conv1d(
@@ -348,7 +381,7 @@ class Mamba2Block(nn.Module):
         B: torch.Tensor,
         C: torch.Tensor,
         h_prev: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ):
         """
         Single recurrent step (for autoregressive inference).
         Only processes the last token.
@@ -361,7 +394,9 @@ class Mamba2Block(nn.Module):
             h_prev: Previous state (batch, d_inner, d_state) or None for first step
 
         Returns:
-            y_t: Output (batch, 1, d_inner)
+            (y_t, h_t) tuple:
+              - y_t: Output (batch, 1, d_inner)
+              - h_t: Updated hidden state (batch, d_inner, d_state)
         """
         batch, seqlen, d_inner = x.shape
         d_state = self.d_state
@@ -390,7 +425,7 @@ class Mamba2Block(nn.Module):
         # Skip connection
         y_t = y_t + self.D * x_t
 
-        return y_t.unsqueeze(1)  # (batch, 1, d_inner)
+        return y_t.unsqueeze(1), h_t  # (batch, 1, d_inner), (batch, d_inner, d_state)
 
     def extra_repr(self) -> str:
         return (

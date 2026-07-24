@@ -209,6 +209,7 @@ class MamformerTokenizer:
 
 def load_tokenizer(
     pretrained_name: str = "huggyllama/llama-7b",
+    expected_vocab_size: int = 0,
     **kwargs,
 ) -> MamformerTokenizer:
     """
@@ -219,6 +220,7 @@ def load_tokenizer(
 
     Args:
         pretrained_name: HuggingFace model name for tokenizer
+        expected_vocab_size: If > 0, warns if tokenizer vocab doesn't match
         **kwargs: Additional args passed to AutoTokenizer.from_pretrained
 
     Returns:
@@ -227,7 +229,15 @@ def load_tokenizer(
     try:
         from transformers import AutoTokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained(pretrained_name, **kwargs)
-        return MamformerTokenizer(hf_tokenizer)
+        tokenizer = MamformerTokenizer(hf_tokenizer)
+        if expected_vocab_size > 0 and tokenizer.vocab_size != expected_vocab_size:
+            import logging
+            logging.warning(
+                f"Tokenizer vocab ({tokenizer.vocab_size}) does not match "
+                f"model vocab ({expected_vocab_size}). Token IDs above "
+                f"{tokenizer.vocab_size} will never be generated."
+            )
+        return tokenizer
     except ImportError:
         print("Warning: transformers not installed. Using simple fallback tokenizer.")
         return MamformerTokenizer()

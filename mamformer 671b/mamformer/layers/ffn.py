@@ -109,11 +109,19 @@ class GEGLUFFN(nn.Module):
         self.up_proj = nn.Linear(d_model, d_ff, bias=bias)
         self.down_proj = nn.Linear(d_ff, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = F.gelu(self.gate_proj(x))
         up = self.up_proj(x)
         return self.down_proj(self.dropout(gate * up))
+
+    def _init_weights(self):
+        std = 0.02
+        for proj in [self.gate_proj, self.up_proj, self.down_proj]:
+            nn.init.normal_(proj.weight, mean=0.0, std=std)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
 
 
 class StandardFFN(nn.Module):
@@ -134,6 +142,14 @@ class StandardFFN(nn.Module):
         self.fc1 = nn.Linear(d_model, d_ff, bias=bias)
         self.fc2 = nn.Linear(d_ff, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self._init_weights()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(self.dropout(F.relu(self.fc1(x))))
+
+    def _init_weights(self):
+        std = 0.02
+        for proj in [self.fc1, self.fc2]:
+            nn.init.normal_(proj.weight, mean=0.0, std=std)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)

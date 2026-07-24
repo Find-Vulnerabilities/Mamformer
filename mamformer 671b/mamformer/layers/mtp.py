@@ -220,9 +220,13 @@ class MultiTokenPredictor(nn.Module):
                 prev_token = input_ids
 
             # ── 2. Embed the previous token ─────────────────────────
-            # Clamp -100 (ignore_index) to 0 to avoid embedding lookup errors
+            # Replace -100 (ignore_index) with 0 for safe embedding lookup
+            # The embed at position 0 will be multiplied by 0 in subsequent loss
+            # computation via labels masking, avoiding sentinel leakage
             prev_token_safe = prev_token.clamp(min=0)
-            token_emb = self.token_embedding(prev_token_safe)  # (batch, seqlen, d_model)
+            # Zero out embeddings where original was -100 (ignore_index)
+            pad_mask = (prev_token == -100).unsqueeze(-1).float()
+            token_emb = self.token_embedding(prev_token_safe) * (1.0 - pad_mask)  # (batch, seqlen, d_model)
 
             # ── 3. Fuse with main hidden states ──────────────────────
             fused = torch.cat([h_current, token_emb], dim=-1)  # (batch, seqlen, 2*d_model)

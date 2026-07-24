@@ -81,7 +81,7 @@ class StreamingTextDataset(torch.utils.data.IterableDataset):
         buffer = []
         for fp in self.files:
             raw_bytes = open(fp, 'rb').read()
-            data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.int16).long()
+            data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
             buffer.extend(data.tolist())
             while len(buffer) >= self.seq_len + 1:
                 chunk = buffer[:self.seq_len + 1]
@@ -325,14 +325,27 @@ def train_distributed(config: dict) -> None:
 
 
 def save_checkpoint(model, optimizer, scheduler, step, output_dir, final=False):
-    """Save distributed training checkpoint."""
-    state_dict = model.state_dict()
+    """Save distributed training checkpoint with FSDP state dict handling."""
+    if hasattr(model, "_is_fsdp_managed_module"):
+        try:
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with model.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = model.state_dict()
+        except Exception:
+            state_dict = model.state_dict()
+    else:
+        state_dict = model.state_dict()
+
     suffix = "final" if final else f"step_{step}"
-    torch.save(
-        {"model": state_dict, "optimizer": optimizer.state_dict(),
-         "scheduler": scheduler.state_dict(), "step": step},
-        output_dir / f"checkpoint_{suffix}.pt",
-    )
+    # All ranks participate in state dict gathering; only rank 0 writes
+    import torch.distributed as dist
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        torch.save(
+            {"model": state_dict, "optimizer": optimizer.state_dict(),
+             "scheduler": scheduler.state_dict(), "step": step},
+            output_dir / f"checkpoint_{suffix}.pt",
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════

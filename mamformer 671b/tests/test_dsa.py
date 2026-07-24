@@ -91,7 +91,7 @@ class TestDifferentialStateAttention:
             assert not torch.allclose(proj.weight.grad, torch.zeros_like(proj.weight.grad))
 
         # Lambda should have gradients
-        assert dsa.lambda_log.grad is not None
+        assert dsa.lambda_raw.grad is not None
 
         # State injection projections should have gradients (even without ssm_state input,
         # they don't get used, so check with ssm_state)
@@ -118,7 +118,7 @@ class TestDifferentialStateAttention:
 
         # Manually update lambda
         with torch.no_grad():
-            dsa.lambda_log -= 0.01 * dsa.lambda_log.grad
+            dsa.lambda_raw -= 0.01 * dsa.lambda_raw.grad
 
         new_lam = dsa.get_lambda_values()
         assert not torch.allclose(new_lam, initial_lam)

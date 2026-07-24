@@ -131,7 +131,7 @@ class DeepSeekMoE(nn.Module):
             torch.zeros(n_routed_experts, dtype=torch.long),
         )
 
-        self._init_weights()
+        DeepSeekMoE._init_weights(self)  # Explicit dispatch for subclass safety
 
     def _init_weights(self):
         """Initialize router with small weights for balanced initial routing."""
@@ -181,10 +181,6 @@ class DeepSeekMoE(nn.Module):
 
         # Softmax normalize gates over selected experts
         top_k_gates = F.softmax(top_k_gates, dim=-1)
-        # Also get the raw scores for expert assignment
-        top_k_scores = torch.gather(
-            F.softmax(router_logits, dim=-1), dim=-1, index=top_k_indices
-        )
 
         # ── 4. Compute routed expert outputs ──────────────────────
         routed_output = self._compute_routed_experts(
@@ -197,12 +193,14 @@ class DeepSeekMoE(nn.Module):
             aux_info["expert_bias_mean"] = self.expert_bias.mean().item()
             aux_info["expert_bias_std"] = self.expert_bias.std().item()
 
-        # Track expert usage for monitoring
+        # Track expert usage for monitoring (vectorized, no per-expert sync)
         if self.training:
             with torch.no_grad():
                 self._total_tokens += batch_size * seq_len
-                for i in range(self.n_routed_experts):
-                    self._expert_counts[i] += (top_k_indices == i).sum().item()
+                # Use bincount instead of per-expert .item() calls
+                flat_indices = top_k_indices.flatten().long()
+                counts = torch.bincount(flat_indices, minlength=self.n_routed_experts)
+                self._expert_counts += counts
 
         aux_info["routed_expert_count"] = self.n_routed_experts
         aux_info["active_experts"] = self.top_k
@@ -213,104 +211,18 @@ class DeepSeekMoE(nn.Module):
         return output, aux_info
 
     def _compute_routed_experts(
-        self,
-        x: torch.Tensor,
-        top_k_indices: torch.Tensor,
-        top_k_gates: torch.Tensor,
-        batch_size: int,
-        seq_len: int,
+        self, x: torch.Tensor, top_k_indices: torch.Tensor,
+        top_k_gates: torch.Tensor, batch_size: int, seq_len: int,
     ) -> torch.Tensor:
-        """
-        Compute routed expert outputs efficiently.
-
-        Groups tokens by expert assignment to minimize expert invocations.
-        Each expert is called once with all tokens assigned to it.
-
-        Args:
-            x: Input (batch, seqlen, d_model)
-            top_k_indices: Expert indices (batch, seqlen, top_k)
-            top_k_gates: Softmax-normalized gates (batch, seqlen, top_k)
-            batch_size, seq_len: Input dimensions
-
-        Returns:
-            Combined output (batch, seqlen, d_model)
-        """
-        d_model = self.d_model
-        output = torch.zeros(batch_size, seq_len, d_model, device=x.device, dtype=x.dtype)
-
-        # Flatten batch and sequence dimensions
-        x_flat = x.view(batch_size * seq_len, d_model)  # (N, d_model)
-        top_k_indices_flat = top_k_indices.view(batch_size * seq_len, self.top_k)  # (N, top_k)
-        top_k_gates_flat = top_k_gates.view(batch_size * seq_len, self.top_k)  # (N, top_k)
-
-        # For each expert, find tokens assigned to it and compute (vectorized)
-        for expert_idx in range(self.n_routed_experts):
-            # Find which (token, top_k_slot) pairs use this expert
-            expert_mask = (top_k_indices_flat == expert_idx)  # (N, top_k)
-
-            # Get the tokens that use this expert
-            token_has_expert = expert_mask.any(dim=-1)  # (N,)
-
-            if not token_has_expert.any():
-                continue
-
-            # Get the input tokens
-            expert_input = x_flat[token_has_expert]  # (n_assigned, d_model)
-
-            # Compute expert output
-            expert_output = self.routed_experts[expert_idx](expert_input)  # (n_assigned, d_model)
-
-            # Vectorized gate extraction: find first True slot for each token
-            # expert_mask[token_has_expert].float().argmax(dim=-1) gives the slot index
-            slot_indices = expert_mask[token_has_expert].float().argmax(dim=-1)  # (n_assigned,)
-            token_indices = token_has_expert.nonzero(as_tuple=True)[0]  # (n_assigned,)
-            gates_for_tokens = top_k_gates_flat[token_indices, slot_indices]  # (n_assigned,)
-
-            # Apply gating and accumulate
-            expert_output = expert_output * gates_for_tokens.unsqueeze(-1)
-            output.view(batch_size * seq_len, d_model)[token_indices] += expert_output
-
-        return output
-
-    def _update_expert_bias(
-        self,
-        top_k_indices: torch.Tensor,
-        total_tokens: int,
-    ) -> None:
-        """
-        Update expert biases for aux-loss-free load balancing.
-
-        DeepSeek V3 method: after each training step, adjust each expert's
-        bias based on whether it was over- or under-utilized relative to
-        the expected load.
-
-        Expected load per expert = top_k / n_routed_experts
-        Actual load = fraction of tokens assigned to expert
-
-        bias -= β * sign(actual_load - expected_load)
-
-        This encourages balanced expert utilization without the gradient
-        distortion caused by auxiliary loss terms.
-        """
-        # Count assignments per expert
-        expert_counts = torch.zeros(
-            self.n_routed_experts, device=top_k_indices.device, dtype=torch.float32
+        return _moe_compute_routed_experts(
+            x, top_k_indices, top_k_gates, batch_size, seq_len,
+            self.d_model, self.top_k, self.n_routed_experts, self.routed_experts,
         )
-        for i in range(self.n_routed_experts):
-            expert_counts[i] = (top_k_indices == i).sum().float()
 
-        # Actual load fraction
-        actual_load = expert_counts / (total_tokens * self.top_k)
-        # Expected load (uniform)
-        expected_load = 1.0 / self.n_routed_experts
-
-        # Update bias: decrease if overloaded, increase if underloaded
-        load_deviation = actual_load - expected_load
-        self.expert_bias -= self.bias_update_speed * torch.sign(load_deviation)
-
-        # Update EMA for monitoring
-        self.expert_load_ema = (
-            0.99 * self.expert_load_ema + 0.01 * actual_load
+    def _update_expert_bias(self, top_k_indices: torch.Tensor, total_tokens: int) -> None:
+        _moe_update_expert_bias(
+            top_k_indices, total_tokens, self.n_routed_experts, self.top_k,
+            self.bias_update_speed, self.expert_bias, self.expert_load_ema,
         )
 
     def get_load_statistics(self) -> dict:
@@ -391,6 +303,48 @@ class DeepSeekMoE(nn.Module):
             f"top_k={self.top_k}, "
             f"load_balance={'aux-loss-free' if self.aux_loss_free else 'aux_loss'}"
         )
+
+
+# ── Shared MoE helpers (used by both DeepSeekMoE and SpaceTimeMoE) ─────────
+
+def _moe_compute_routed_experts(
+    x: torch.Tensor, top_k_indices: torch.Tensor, top_k_gates: torch.Tensor,
+    batch_size: int, seq_len: int, d_model: int, top_k: int,
+    n_routed_experts: int, routed_experts: nn.ModuleList,
+) -> torch.Tensor:
+    """Compute routed expert outputs efficiently. Shared by DeepSeekMoE and SpaceTimeMoE."""
+    output = torch.zeros(batch_size, seq_len, d_model, device=x.device, dtype=x.dtype)
+    x_flat = x.view(batch_size * seq_len, d_model)
+    idx_flat = top_k_indices.view(batch_size * seq_len, top_k)
+    gate_flat = top_k_gates.view(batch_size * seq_len, top_k)
+    for expert_idx in range(n_routed_experts):
+        expert_mask = (idx_flat == expert_idx)
+        token_has_expert = expert_mask.any(dim=-1)
+        if not token_has_expert.any():
+            continue
+        expert_input = x_flat[token_has_expert]
+        expert_output = routed_experts[expert_idx](expert_input)
+        slot_indices = expert_mask[token_has_expert].float().argmax(dim=-1)
+        token_indices = token_has_expert.nonzero(as_tuple=True)[0]
+        gates_for_tokens = gate_flat[token_indices, slot_indices]
+        expert_output = expert_output * gates_for_tokens.unsqueeze(-1)
+        output.view(batch_size * seq_len, d_model)[token_indices] += expert_output
+    return output
+
+
+def _moe_update_expert_bias(
+    top_k_indices: torch.Tensor, total_tokens: int,
+    n_routed_experts: int, top_k: int, bias_update_speed: float,
+    expert_bias: torch.Tensor, expert_load_ema: torch.Tensor,
+) -> None:
+    """Aux-loss-free expert bias update. Shared by DeepSeekMoE and SpaceTimeMoE."""
+    flat_indices = top_k_indices.flatten().long()
+    expert_counts = torch.bincount(flat_indices, minlength=n_routed_experts).float()
+    actual_load = expert_counts / (total_tokens * top_k + 1e-8)
+    expected_load = 1.0 / n_routed_experts
+    load_deviation = actual_load - expected_load
+    expert_bias -= bias_update_speed * torch.sign(load_deviation)
+    expert_load_ema.copy_(0.99 * expert_load_ema + 0.01 * actual_load)
 
 
 class _SwiGLUExpert(nn.Module):

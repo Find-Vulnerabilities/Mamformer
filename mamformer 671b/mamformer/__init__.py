@@ -16,6 +16,7 @@ from mamformer.model import MamformerModel, MamformerForCausalLM
 from mamformer.tokenizer import MamformerTokenizer
 from mamformer.generation import GenerationMixin
 from mamformer.reflection import ReflectionModule, SelfReflectiveGenerator, add_reflection_to_model
+from mamformer.layers.communicative_moe import CommunicativeMoE
 
 __version__ = "0.2.0"
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "ReflectionModule",
     "SelfReflectiveGenerator",
     "add_reflection_to_model",
+    "CommunicativeMoE",
 ]

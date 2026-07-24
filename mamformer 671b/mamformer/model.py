@@ -25,6 +25,7 @@ from mamformer.config import MamformerConfig
 from mamformer.layers.norm import RMSNorm
 from mamformer.layers.hybrid import MamformerBlock
 from mamformer.layers.mtp import MultiTokenPredictor
+from mamformer.generation import GenerationMixin
 
 
 class MamformerModel(nn.Module):
@@ -66,15 +67,21 @@ class MamformerModel(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 sliding_window=config.sliding_window if config.use_sliding_window else 0,
                 # DSA options
-                use_dsa=config.dsa.enabled,
+                use_dsa=config.dsa.enabled and not config.kda_diff.enabled,
                 dsa_lambda_init=config.dsa.lambda_init,
                 dsa_state_injection=config.dsa.use_state_injection,
+                # KDA-Diff options
+                use_kda_diff=config.kda_diff.enabled,
+                kda_linear_ratio=config.kda_diff.linear_ratio,
+                kda_kernel_dim=config.kda_diff.kernel_dim,
+                kda_latent_dim=config.kda_diff.latent_dim,
+                kda_use_dynamic_ratio=config.kda_diff.use_dynamic_ratio,
                 # YaRN options
                 rope_use_yarn=config.rope.use_yarn,
                 rope_yarn_scale=config.rope.yarn_scale,
                 rope_yarn_original_max_seq_len=config.rope.yarn_original_max_seq_len,
                 # MoE options
-                use_moe=config.moe.enabled,
+                use_moe=config.moe.enabled and not config.st_moe.enabled,
                 moe_n_shared=config.moe.n_shared_experts,
                 moe_n_routed=config.moe.n_routed_experts,
                 moe_top_k=config.moe.top_k,
@@ -82,6 +89,18 @@ class MamformerModel(nn.Module):
                 moe_routed_dim=config.moe.routed_expert_intermediate_dim,
                 moe_aux_loss_free=config.moe.aux_loss_free,
                 moe_bias_speed=config.moe.bias_update_speed,
+                # ST-MoE options
+                use_st_moe=config.st_moe.enabled,
+                st_moe_lambda_init=config.st_moe.lambda_init,
+                st_moe_lambda_max=config.st_moe.lambda_max,
+                st_moe_learnable_lambda=config.st_moe.learnable_lambda,
+                st_moe_use_balance_lock=config.st_moe.use_balance_lock,
+                st_moe_balance_lock_threshold=config.st_moe.balance_lock_threshold,
+                # Communicative MoE options
+                use_communicative_moe=config.communicative_moe.enabled,
+                comm_moe_n_heads=config.communicative_moe.n_comm_heads,
+                comm_moe_depth=config.communicative_moe.comm_depth,
+                comm_moe_dropout=config.communicative_moe.comm_dropout,
             )
             for _ in range(config.n_layers)
         ])
@@ -153,12 +172,20 @@ class MamformerModel(nn.Module):
 
             if self.gradient_checkpointing and self.training:
                 # Use activation checkpointing to save memory
+                # NOTE: gradient checkpointing is incompatible with KV caching.
+                # During training, caching is not needed, so we disable it.
                 def make_custom_forward(layer):
-                    def custom_forward(*inputs):
-                        return layer(inputs[0], attention_mask=inputs[1] if len(inputs) > 1 else None)
+                    def custom_forward(hidden_states, attention_mask):
+                        outputs = layer(
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            use_cache=False,
+                            cache=None,
+                        )
+                        return outputs[0]  # Return only hidden_states
                     return custom_forward
 
-                hidden_states, _ = activation_checkpoint(
+                hidden_states = activation_checkpoint(
                     make_custom_forward(layer),
                     hidden_states,
                     attention_mask,
@@ -247,12 +274,16 @@ class MamformerModel(nn.Module):
         print(sep)
 
 
-class MamformerForCausalLM(nn.Module):
+class MamformerForCausalLM(GenerationMixin, nn.Module):
     """
     Mamformer model with a language modeling head (causal LM).
 
+    Inherits from GenerationMixin for beam search, streaming generation,
+    and repetition penalty helpers. The model's own generate() takes
+    precedence for the primary API.
+
     Architecture:
-        Token IDs → MamformerModel → RMSNorm → lm_head → logits
+        Token IDs -> MamformerModel -> RMSNorm -> lm_head -> logits
         (Optional) MTP heads for multi-token prediction
 
     The lm_head weight is tied with the token embedding weight
@@ -431,13 +462,24 @@ class MamformerForCausalLM(nn.Module):
             top_p = gen_cfg.default_top_p
         batch_size = input_ids.shape[0]
         device = input_ids.device
+        rep_penalty = gen_cfg.repetition_penalty
+        dtype_min = torch.finfo(torch.float32).min
         generated = input_ids.clone()
         cache = None
+        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
 
         for _ in range(max_new_tokens):
-            # Forward pass with cache
+            if not unfinished.any():
+                break
+
+            # Forward pass with cache (only last token when cache available)
+            if cache is not None:
+                current_input = generated[:, -1:]
+            else:
+                current_input = generated
+
             outputs = self.forward(
-                input_ids=generated[:, -1:] if cache is not None else generated,
+                input_ids=current_input,
                 use_cache=True,
                 cache=cache,
             )
@@ -445,46 +487,101 @@ class MamformerForCausalLM(nn.Module):
             logits = outputs["logits"][:, -1, :]  # (batch, vocab_size)
             cache = outputs.get("cache")
 
+            # Repetition penalty: penalize already-generated tokens
+            if rep_penalty != 1.0:
+                for i in range(batch_size):
+                    for token_id in set(generated[i].tolist()):
+                        if logits[i, token_id] > 0:
+                            logits[i, token_id] /= rep_penalty
+                        else:
+                            logits[i, token_id] *= rep_penalty
+
             # Temperature scaling
             if temperature > 0 and temperature != 1.0:
                 logits = logits / temperature
 
             # Top-k filtering
             if top_k > 0:
-                top_k_values, _ = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)
-                min_top_k = top_k_values[:, -1].unsqueeze(-1)
-                logits = logits.masked_fill(logits < min_top_k, float("-inf"))
+                k = min(top_k, logits.size(-1))
+                top_k_values, _ = torch.topk(logits, k, dim=-1)
+                logits = logits.masked_fill(logits < top_k_values[:, -1:], dtype_min)
 
             # Top-p (nucleus) filtering
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(
-                    F.softmax(sorted_logits, dim=-1), dim=-1
-                )
-                # Remove tokens with cumulative probability above threshold
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-                sorted_indices_to_remove[:, 0] = False
-                indices_to_remove = sorted_indices_to_remove.scatter(
-                    1, sorted_indices, sorted_indices_to_remove
-                )
-                logits = logits.masked_fill(indices_to_remove, float("-inf"))
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_mask = cumulative_probs > top_p
+                sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
+                sorted_mask[:, 0] = False
+                mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
+                logits = logits.masked_fill(mask, dtype_min)
 
             # Sample or greedy
-            if temperature == 0:
+            if temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:
                 probs = F.softmax(logits, dim=-1)
+                probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
                 next_token = torch.multinomial(probs, num_samples=1)
+
+            # Mask finished sequences (keep generating pad for uniformity)
+            next_token = next_token.masked_fill(~unfinished.unsqueeze(-1), pad_token_id or 0)
 
             generated = torch.cat([generated, next_token], dim=-1)
 
-            # Check for EOS
+            # Track which sequences have hit EOS
             if eos_token_id is not None:
-                if (next_token == eos_token_id).all():
-                    break
+                unfinished = unfinished & (next_token.squeeze(-1) != eos_token_id)
 
         return generated
+
+    def get_log_probs(
+        self,
+        input_ids: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Compute per-token log probabilities. Used by GRPO training.
+
+        Returns average log-probability over non-masked response tokens.
+        If labels is None, returns log-probs for all tokens (for generation scoring).
+
+        Args:
+            input_ids: Token indices (batch, seqlen)
+            labels: Target labels, -100 for ignored positions
+            attention_mask: Optional attention mask
+
+        Returns:
+            If labels provided: (batch,) average log-prob per response token
+            If no labels: (batch, seqlen-1) token-level log-probs
+        """
+        outputs = self.forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        logits = outputs["logits"]  # (batch, seqlen, vocab_size)
+
+        # Shift for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()  # (batch, seqlen-1, vocab)
+        shift_input_ids = input_ids[:, 1:].contiguous()  # (batch, seqlen-1)
+
+        # Token-level log probabilities
+        log_probs = F.log_softmax(shift_logits, dim=-1)  # (batch, seqlen-1, vocab)
+        token_log_probs = log_probs.gather(
+            dim=-1, index=shift_input_ids.unsqueeze(-1).clamp(min=0)
+        ).squeeze(-1)  # (batch, seqlen-1)
+
+        if labels is not None:
+            # Mask: only consider response tokens
+            shift_labels = labels[:, 1:].contiguous()  # (batch, seqlen-1)
+            response_mask = (shift_labels != -100).float()  # (batch, seqlen-1)
+            total_tokens = response_mask.sum(dim=1).clamp(min=1)  # (batch,)
+            avg_log_probs = (token_log_probs * response_mask).sum(dim=1) / total_tokens
+            return avg_log_probs  # (batch,)
+
+        return token_log_probs  # (batch, seqlen-1)
 
     def num_parameters(self) -> int:
         """Total number of trainable parameters."""

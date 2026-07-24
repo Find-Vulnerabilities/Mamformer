@@ -219,7 +219,8 @@ class CachedRotaryEmbedding(RotaryEmbedding):
     """
     Backward-compatible RotaryEmbedding that precomputes tables for
     the full max_seq_len. Use only for short-context models (<32K).
-    For long context (128K+), use RotaryEmbedding (dynamic) instead.
+    For long context (128K+), automatically falls back to dynamic computation
+    to avoid multi-GB cached tables.
     """
 
     def __init__(
@@ -231,6 +232,7 @@ class CachedRotaryEmbedding(RotaryEmbedding):
         yarn_scale: float = 1.0,
         yarn_original_max_seq_len: Optional[int] = None,
     ) -> None:
+        self._use_cached_table = max_seq_len <= 131072  # 128K threshold
         super().__init__(
             head_dim=head_dim,
             max_seq_len=max_seq_len,
@@ -240,11 +242,14 @@ class CachedRotaryEmbedding(RotaryEmbedding):
             yarn_original_max_seq_len=yarn_original_max_seq_len,
         )
 
-        # Precompute for full length (backward compatible but memory-heavy)
-        self._precompute_full_table()
+        if self._use_cached_table:
+            self._precompute_full_table()
 
     def _precompute_full_table(self):
-        """Precompute cos/sin for max_seq_len (backward compat)."""
+        """Precompute cos/sin for max_seq_len (backward compat).
+        WARNING: For max_seq_len > 131072 (128K), the cached table can be
+        hundreds of MB. Use RotaryEmbedding (dynamic) instead for long contexts.
+        """
         angles = self._compute_freqs(self.max_seq_len, torch.device("cpu"))  # (max_seq_len, head_dim/2)
         angles = torch.cat([angles, angles], dim=-1)
 
@@ -257,11 +262,13 @@ class CachedRotaryEmbedding(RotaryEmbedding):
     def forward(
         self, seq_len: int, device: torch.device, offset: int = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Slice from precomputed table (fast but memory-heavy)."""
-        return (
-            self.cos[:, :, offset:offset + seq_len].to(device),
-            self.sin[:, :, offset:offset + seq_len].to(device),
-        )
+        """Slice from precomputed table, or dynamic compute for long contexts."""
+        if self._use_cached_table:
+            return (
+                self.cos[:, :, offset:offset + seq_len].to(device),
+                self.sin[:, :, offset:offset + seq_len].to(device),
+            )
+        return super().forward(seq_len, device, offset)
 
     def extra_repr(self) -> str:
         yarn_info = f", YaRN(scale={self.yarn_scale})" if self.use_yarn else ""

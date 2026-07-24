@@ -202,10 +202,10 @@ def evaluate_multiple_choice(
 
             log_probs = F.log_softmax(logits, dim=-1)
             choice_log_prob = 0.0
-            # logits[i] predicts token at position i+1 (causal LM shift)
-            # So for choice tokens at positions [choice_start, len), use log_probs[i-1]
+            # Causal LM shift: log_probs[p] models P(token_{p+1})
+            # Token at position i was predicted by logits at position i-1
             for i in range(choice_start, len(input_ids)):
-                token_id = input_ids[i]
+                token_id = input_ids[i].item()
                 choice_log_prob += log_probs[i-1, token_id].item()
 
             # Normalize by choice length
@@ -533,10 +533,10 @@ def evaluate(
             all_mistral.append(mistral)
 
     if all_scores:
-        avg_Mamformer = sum(all_scores) / len(all_scores)
+        avg_mamformer = sum(all_scores) / len(all_scores)
         avg_mistral = sum(all_mistral) / len(all_mistral)
         print(f"  {'─' * 50}")
-        print(f"  AVERAGE:  {avg_Mamformer:.1f}%  vs Mistral-7B: {avg_mistral:.1f}%  (Δ: {avg_Mamformer - avg_mistral:+.1f}%)")
+        print(f"  AVERAGE:  {avg_mamformer:.1f}%  vs Mistral-7B: {avg_mistral:.1f}%  (Δ: {avg_mamformer - avg_mistral:+.1f}%)")
 
     print(f"\n{'=' * 70}\n")
 

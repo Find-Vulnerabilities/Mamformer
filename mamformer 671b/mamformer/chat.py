@@ -456,25 +456,25 @@ class ChatSession:
         Think mode: model reasons internally before answering.
 
         Uses <thinking>...</thinking><answer>...</answer> format.
-        The thinking portion is stripped from history (unless show_thinking=True).
+        EOS is suppressed during generation so the model can transition
+        from thinking to answering naturally. max_new_tokens caps total length.
         """
         self._trim_to_context()
 
-        # Build prompt with think template
         prompt = THINK_TEMPLATE.format_conversation(self.messages)
         prompt_clean = self._clean_prompt_for_template(prompt, THINK_TEMPLATE)
 
         input_ids = self.tokenizer.encode(prompt_clean, add_bos=False)
         input_tensor = torch.tensor([input_ids], device=self.device)
 
-        # Generate with extra tokens for thinking
+        # Suppress EOS so model continues through </thinking> into <answer>
         output_ids = self.model.generate(
             input_ids=input_tensor,
             max_new_tokens=self.think_tokens + self.max_new_tokens,
             temperature=self.temperature,
             top_k=self.top_k,
             top_p=self.top_p,
-            eos_token_id=self.tokenizer.eos_token_id,
+            eos_token_id=None,  # Suppress early stopping
         )
 
         full_output = self.tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)

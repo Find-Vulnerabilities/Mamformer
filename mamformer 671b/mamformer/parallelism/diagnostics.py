@@ -310,6 +310,8 @@ class PipelineBubbleAnalyzer:
       Bubble ratio ≈ (pp - 1) / (pp - 1 + m)
 
     This decreases as m increases (more microbatches = less bubble).
+    NOTE: record_step() is for actual measurements but requires integration
+    with the training loop (not yet wired up). Currently provides theoretical values.
     """
 
     def __init__(self, pp_size: int, num_microbatches: int):
@@ -326,7 +328,9 @@ class PipelineBubbleAnalyzer:
 
     def record_step(self, compute_time: float, idle_time: float):
         """Record actual times for one pipeline step."""
-        self._total_compute_time = getattr(self, '_total_compute_time', 0.0) + compute_time
+        if not hasattr(self, '_total_compute_time'):
+            self._total_compute_time = 0.0
+        self._total_compute_time += compute_time
         self._total_idle_time += idle_time
         self._total_step_time += compute_time + idle_time
         self._step_count += 1
@@ -473,6 +477,10 @@ class ParallelismMonitor:
             total_step_time = time.perf_counter() - self._step_start_time
             comm_time = self.comm_monitor.get_total_comm_time()
             compute_time = max(0, total_step_time - comm_time)
+            idle_time = max(0, total_step_time - compute_time - comm_time)
+
+            # Wire actual measurements into bubble analyzer
+            self.bubble_analyzer.record_step(compute_time, idle_time)
 
             self._step_compute_time += compute_time
             self._step_start_time = None

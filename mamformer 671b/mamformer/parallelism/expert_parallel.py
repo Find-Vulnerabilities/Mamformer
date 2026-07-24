@@ -449,7 +449,8 @@ class EPMoE(nn.Module):
         return shared_out + routed_out, aux_info
 
     def _ep_routed_forward(self, x, top_k_indices, top_k_gates):
-        """EP-aware routed expert computation with all-to-all dispatch/combine."""
+        """EP-aware routed expert computation with all-to-all dispatch/combine
+        for ALL top-k assignments (not just primary)."""
         B, S, D = x.shape
         N = B * S
         device = x.device
@@ -459,81 +460,57 @@ class EPMoE(nn.Module):
         idx_flat = top_k_indices.view(N, self.top_k)
         gate_flat = top_k_gates.view(N, self.top_k)
 
-        # For each token, pick the first (highest-scoring) expert assignment
-        # as the primary target for dispatch
-        primary_expert_idx = idx_flat[:, 0]  # (N,) — first top-k expert
+        output = torch.zeros(N, D, device=device, dtype=x.dtype)
 
-        # Dispatch: send tokens to GPUs that own their assigned experts
-        dispatched_x, sort_order, token_counts, recv_counts = expert_dispatch(
-            x_flat, primary_expert_idx,
-            self.n_routed_experts_total, self.ep_group,
-        )
+        # Process each of the top-k slots with proper dispatch/combine
+        # Each slot dispatches tokens to the GPU owning the assigned expert
+        for k in range(self.top_k):
+            expert_idx_k = idx_flat[:, k]  # (N,) — expert for slot k
+            gates_k = gate_flat[:, k]     # (N,) — gate for slot k
 
-        # Process dispatched tokens with local experts
-        # dispatched_x contains tokens received by this rank from ALL source ranks
-        # recv_counts[r] = how many tokens came from source rank r
-        if dispatched_x.shape[0] > 0:
+            # Dispatch tokens to GPUs that own expert_idx_k
+            dispatched_x, sort_order, token_counts, recv_counts = expert_dispatch(
+                x_flat, expert_idx_k,
+                self.n_routed_experts_total, self.ep_group,
+            )
+
+            if dispatched_x.shape[0] == 0:
+                continue
+
+            # Process dispatched tokens with local experts
             dispatched_output = torch.zeros_like(dispatched_x)
 
-            # Build expert index for each dispatched token
-            # Token i in dispatched_x was sent here because it was assigned to one of OUR experts
-            # We need to recover which expert each token was assigned to
-            # During dispatch, the expert indices were NOT packed — we need to recover them
-            # Approach: iterate over local experts, check each one against the received tokens
-            # Since recv_counts tells us which source rank sent each chunk,
-            # and we know the source rank's primary_expert_idx (not available locally),
-            # we use a different strategy: compute expert assignment directly from x
-
-            # Simplified: re-compute expert assignment for dispatched tokens using router
-            # (router is replicated, so we can recompute locally)
-            dispatched_router_logits = F.linear(dispatched_x, self.router.weight)
+            # Recompute router logits to determine which local expert each token needs
             if self.aux_loss_free and self.training:
-                dispatched_router_logits = dispatched_router_logits + self.expert_bias
-            _, dispatched_expert_idx = torch.topk(dispatched_router_logits, k=1, dim=-1)
-            dispatched_expert_idx = dispatched_expert_idx.squeeze(-1)  # (n_received,)
+                dispatched_gating = F.linear(dispatched_x, self.router.weight) + self.expert_bias
+            else:
+                dispatched_gating = F.linear(dispatched_x, self.router.weight)
+            _, dispatched_exp_idx = torch.topk(dispatched_gating, k=1, dim=-1)
+            dispatched_exp_idx = dispatched_exp_idx.squeeze(-1)
 
             for local_idx in range(self.n_local_experts):
                 global_expert_idx = self.expert_start + local_idx
                 expert = self.routed_experts[local_idx]
 
-                # Find which dispatched tokens are assigned to this expert
-                expert_mask = (dispatched_expert_idx == global_expert_idx)
+                expert_mask = (dispatched_exp_idx == global_expert_idx)
                 if not expert_mask.any():
                     continue
 
                 expert_input = dispatched_x[expert_mask]
                 expert_output = expert(expert_input)
 
-                # Get gate values — recompute using local router probs
-                probs = F.softmax(dispatched_router_logits[expert_mask], dim=-1)
-                expert_gates = probs[:, global_expert_idx]  # Probability assigned to this expert
+                # Gate: softmax probability for this expert
+                probs = F.softmax(dispatched_gating[expert_mask], dim=-1)
+                expert_gates = probs[:, global_expert_idx]
 
                 dispatched_output[expert_mask] += expert_output * expert_gates.unsqueeze(-1)
-        else:
-            dispatched_output = torch.zeros(0, D, device=device, dtype=x.dtype)
 
-        # Combine: send results back to original ranks/positions
-        combined = expert_combine(
-            dispatched_output, sort_order, token_counts,
-            N, self.ep_group, recv_counts,
-        )
-
-        # Handle secondary expert assignments (top_k > 1): process locally
-        # Tokens assigned to non-primary experts on the same GPU
-        output = combined
-        if self.top_k > 1:
-            for k in range(1, self.top_k):
-                secondary_idx = idx_flat[:, k]
-                secondary_gates = gate_flat[:, k]
-                for local_idx in range(self.n_local_experts):
-                    global_expert_idx = self.expert_start + local_idx
-                    expert = self.routed_experts[local_idx]
-                    sec_mask = (secondary_idx == global_expert_idx)
-                    if not sec_mask.any():
-                        continue
-                    sec_input = x_flat[sec_mask]
-                    sec_output = expert(sec_input)
-                    output[sec_mask] += sec_output * secondary_gates[sec_mask].unsqueeze(-1)
+            # Combine results back to original token order
+            combined_k = expert_combine(
+                dispatched_output, sort_order, token_counts,
+                N, self.ep_group, recv_counts,
+            )
+            output += combined_k
 
         return output.view(B, S, D)
 
@@ -546,8 +523,7 @@ class EPMoE(nn.Module):
         self.expert_bias -= self.bias_update_speed * torch.sign(actual_load - expected_load)
 
 
-# _SwiGLUExpert is imported from mamformer.layers.moe to avoid duplication
-from mamformer.layers.moe import _SwiGLUExpert
+from mamformer.layers.moe import _SwiGLUExpert  # noqa: E402 (import after class def)
 
 
 def shard_experts_ep(model: nn.Module, ep_group: ExpertParallelGroup) -> nn.Module:

@@ -39,9 +39,11 @@ import torch.nn as nn
 from mamformer.layers.norm import RMSNorm
 from mamformer.layers.attention import GroupedQueryAttention
 from mamformer.layers.dsa import DifferentialStateAttention
+from mamformer.layers.kda_diff import KDADiffAttention
 from mamformer.layers.mamba2 import Mamba2Block
 from mamformer.layers.ffn import SwiGLUFFN
 from mamformer.layers.moe import DeepSeekMoE
+from mamformer.layers.math_opt import DynamicGate, DeepNorm
 
 
 class MamformerBlock(nn.Module):
@@ -125,13 +127,40 @@ class MamformerBlock(nn.Module):
         moe_routed_dim: int = 576,
         moe_aux_loss_free: bool = True,
         moe_bias_speed: float = 0.001,
+        # ST-MoE (Space-Time MoE)
+        use_st_moe: bool = False,
+        st_moe_lambda_init: float = 0.2,
+        st_moe_lambda_max: float = 0.3,
+        st_moe_learnable_lambda: bool = True,
+        st_moe_use_balance_lock: bool = True,
+        st_moe_balance_lock_threshold: int = 50,
+        # Communicative MoE
+        use_communicative_moe: bool = False,
+        comm_moe_n_heads: int = 4,
+        comm_moe_depth: int = 1,
+        comm_moe_dropout: float = 0.0,
+        # KDA-Diff
+        use_kda_diff: bool = False,
+        kda_linear_ratio: int = 3,
+        kda_kernel_dim: int = 128,
+        kda_latent_dim: int = 512,
+        kda_use_dynamic_ratio: bool = True,
+        # DynamicGate (math_opt integration)
+        use_dynamic_gate: bool = False,
+        dynamic_gate_bottleneck: int = 0,
+        # DeepNorm (math_opt integration)
+        use_deepnorm: bool = False,
+        deepnorm_n_layers: int = 52,
     ) -> None:
         super().__init__()
 
         self.d_model = d_model
         self.sliding_window = sliding_window
         self.use_dsa = use_dsa
+        self.use_kda_diff = use_kda_diff
         self.use_moe = use_moe
+        self.use_st_moe = use_st_moe
+        self.use_dynamic_gate = use_dynamic_gate
 
         # Common RoPE config for attention modules
         rope_kwargs = dict(
@@ -145,8 +174,26 @@ class MamformerBlock(nn.Module):
         # Pre-attention normalization
         self.input_norm = RMSNorm(d_model, eps=rms_norm_eps)
 
-        # Attention pathway: GQA or DSA
-        if use_dsa:
+        # Attention pathway: GQA, DSA, or KDA-Diff
+        if use_kda_diff:
+            self.attention = KDADiffAttention(
+                d_model=d_model,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                head_dim=head_dim,
+                linear_ratio=kda_linear_ratio,
+                kernel_dim=kda_kernel_dim,
+                latent_dim=kda_latent_dim,
+                lambda_init=dsa_lambda_init,
+                use_state_injection=dsa_state_injection,
+                state_injection_dim=64,
+                use_dynamic_ratio=kda_use_dynamic_ratio,
+                d_state=d_state,
+                dropout=dropout,
+                sliding_window=sliding_window,
+                **rope_kwargs,
+            )
+        elif use_dsa:
             self.attention = DifferentialStateAttention(
                 d_model=d_model,
                 n_heads=n_heads,
@@ -179,14 +226,41 @@ class MamformerBlock(nn.Module):
 
         # Learnable per-dimension gate
         # Initialized to 0 → sigmoid(0) = 0.5 → equal weight to both pathways
-        self.gate_alpha = nn.Parameter(torch.zeros(d_model))
+        # When use_dynamic_gate=True, replaced by a context-dependent MLP gate
+        if use_dynamic_gate:
+            self.gate_alpha = None
+            self.dynamic_gate = DynamicGate(d_model=d_model, bottleneck=dynamic_gate_bottleneck)
+        else:
+            self.gate_alpha = nn.Parameter(torch.zeros(d_model))
+            self.dynamic_gate = None
 
         # Post-fusion normalization
         self.post_norm = RMSNorm(d_model, eps=rms_norm_eps)
 
-        # Feed-forward network: MoE or dense SwiGLU
-        if use_moe:
-            self.ffn = DeepSeekMoE(
+        # Feed-forward network: ST-MoE, MoE, or dense SwiGLU
+        # Build base MoE first, then optionally wrap with CommunicativeMoE
+        base_moe = None
+        if use_st_moe:
+            from mamformer.layers.st_moe import SpaceTimeMoE
+            base_moe = SpaceTimeMoE(
+                d_model=d_model,
+                n_shared_experts=moe_n_shared,
+                shared_expert_dim=moe_shared_dim,
+                n_routed_experts=moe_n_routed,
+                top_k=moe_top_k,
+                routed_expert_dim=moe_routed_dim,
+                d_state=d_state,
+                lambda_init=st_moe_lambda_init,
+                lambda_max=st_moe_lambda_max,
+                learnable_lambda=st_moe_learnable_lambda,
+                use_balance_lock=st_moe_use_balance_lock,
+                balance_lock_threshold=st_moe_balance_lock_threshold,
+                aux_loss_free=moe_aux_loss_free,
+                bias_update_speed=moe_bias_speed,
+                dropout=dropout,
+            )
+        elif use_moe:
+            base_moe = DeepSeekMoE(
                 d_model=d_model,
                 n_shared_experts=moe_n_shared,
                 shared_expert_dim=moe_shared_dim,
@@ -197,6 +271,19 @@ class MamformerBlock(nn.Module):
                 bias_update_speed=moe_bias_speed,
                 dropout=dropout,
             )
+
+        # Wrap with CommunicativeMoE if enabled
+        if use_communicative_moe and base_moe is not None:
+            from mamformer.layers.communicative_moe import CommunicativeMoE
+            self.ffn = CommunicativeMoE(
+                base_moe=base_moe,
+                d_model=d_model,
+                n_comm_heads=comm_moe_n_heads,
+                comm_depth=comm_moe_depth,
+                comm_dropout=comm_moe_dropout,
+            )
+        elif base_moe is not None:
+            self.ffn = base_moe
         else:
             self.ffn = SwiGLUFFN(
                 d_model=d_model,
@@ -232,19 +319,29 @@ class MamformerBlock(nn.Module):
         attn_cache = cache.get("attn") if cache is not None else None
         ssm_cache = cache.get("ssm") if cache is not None else None
 
-        # SSM runs first so DSA can access its state for cross-pollination
-        ssm_out, ssm_new_cache = self.ssm(
-            hidden_states,
-            use_cache=use_cache,
-            cache=ssm_cache,
-        )
+        # SSM runs first so DSA/KDA-Diff can access its state for cross-pollination
+        # ST-MoE needs per-timestep h-state summaries for temporal routing
+        ssm_h_states = None
+        need_h_states = self.use_st_moe or self.use_dsa or self.use_kda_diff
+        if need_h_states:
+            ssm_result = self.ssm(
+                hidden_states,
+                use_cache=use_cache,
+                cache=ssm_cache,
+                return_h_states=True,
+            )
+            ssm_out, ssm_new_cache, ssm_h_states = ssm_result
+        else:
+            ssm_out, ssm_new_cache = self.ssm(
+                hidden_states,
+                use_cache=use_cache,
+                cache=ssm_cache,
+            )
 
-        # DSA can optionally receive SSM state for cross-pollination
+        # DSA/KDA-Diff receives per-timestep SSM state summaries for cross-pollination
         ssm_kwargs = {}
-        if self.use_dsa and ssm_new_cache is not None:
-            ssm_state = ssm_new_cache.get("ssm_state")
-            if ssm_state is not None:
-                ssm_kwargs = {"ssm_state": ssm_state}
+        if (self.use_dsa or self.use_kda_diff) and ssm_h_states is not None:
+            ssm_kwargs = {"h_states": ssm_h_states}
 
         attn_out, attn_new_cache = self.attention(
             hidden_states,
@@ -254,8 +351,11 @@ class MamformerBlock(nn.Module):
             **ssm_kwargs,
         )
 
-        # Learnable gated fusion
-        gate = torch.sigmoid(self.gate_alpha)  # (d_model,)
+        # Learnable gated fusion (static or dynamic)
+        if self.dynamic_gate is not None:
+            gate = self.dynamic_gate(hidden_states)  # (d_model,)
+        else:
+            gate = torch.sigmoid(self.gate_alpha)  # (d_model,)
         combined = gate * attn_out + (1.0 - gate) * ssm_out
 
         # First residual connection
@@ -266,7 +366,11 @@ class MamformerBlock(nn.Module):
         hidden_states = self.post_norm(hidden_states)
 
         moe_aux_info = None
-        if self.use_moe:
+        if self.use_st_moe:
+            ffn_out, moe_aux_info = self.ffn(
+                hidden_states, ssm_h_states=ssm_h_states
+            )
+        elif self.use_moe:
             ffn_out, moe_aux_info = self.ffn(hidden_states)
         else:
             ffn_out = self.ffn(hidden_states)
@@ -305,14 +409,24 @@ class MamformerBlock(nn.Module):
         return None
 
     def extra_repr(self) -> str:
-        attn_type = "DSA" if self.use_dsa else "GQA"
-        ffn_type = "MoE" if self.use_moe else "SwiGLU"
+        attn_type = "KDA-Diff" if self.use_kda_diff else ("DSA" if self.use_dsa else "GQA")
+        if self.use_st_moe:
+            ffn_type = "ST-MoE"
+        elif self.use_moe:
+            ffn_type = "MoE"
+        else:
+            ffn_type = "SwiGLU"
+        if hasattr(self, 'ffn') and hasattr(self.ffn, 'comm_layer'):
+            ffn_type = f"Communicative{ffn_type}"
+        n_heads = getattr(self.attention, 'n_heads', '?')
+        n_kv_heads = getattr(self.attention, 'n_kv_heads', '?')
+        head_dim = getattr(self.attention, 'head_dim', '?')
         return (
             f"d_model={self.d_model}, "
             f"attn={attn_type}, ffn={ffn_type}, "
-            f"n_heads={self.attention.n_heads}, "
-            f"n_kv_heads={self.attention.n_kv_heads}, "
-            f"head_dim={self.attention.head_dim}, "
+            f"n_heads={n_heads}, "
+            f"n_kv_heads={n_kv_heads}, "
+            f"head_dim={head_dim}, "
             f"d_state={self.ssm.d_state}, "
             f"d_conv={self.ssm.d_conv}"
         )

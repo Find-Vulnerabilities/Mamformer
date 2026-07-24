@@ -125,7 +125,7 @@ def tokenize_and_save(
             buffer = buffer[seq_len:]
 
             # Write as uint16 (max vocab 65536) or uint32 for larger vocab
-            arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size <= 65536 else np.uint32)
+            arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)
             arr.tofile(current_shard_path)
 
             shard_size += 1
@@ -139,11 +139,10 @@ def tokenize_and_save(
         if total_docs % 10000 == 0:
             print(f"  Processed {total_docs:,} docs, {total_tokens:,} tokens")
 
-    # Flush remaining tokens (pad if needed)
-    if len(buffer) > 0:
-        if len(buffer) < seq_len + 1:
-            buffer += [tokenizer.pad_token_id] * (seq_len + 1 - len(buffer))
-        arr = np.array(buffer[: seq_len + 1], dtype=np.uint16 if tokenizer.vocab_size <= 65536 else np.uint32)
+    # Flush remaining tokens (discard incomplete chunks to avoid padding)
+    if len(buffer) >= seq_len + 1:
+        chunk = buffer[: seq_len + 1]
+        arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)
         arr.tofile(current_shard_path)
         shard_size += 1
 

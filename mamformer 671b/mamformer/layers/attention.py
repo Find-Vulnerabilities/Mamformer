@@ -155,7 +155,10 @@ class GroupedQueryAttention(nn.Module):
         if self.sliding_window > 0:
             sw_mask = self._build_sliding_window_mask(seq_len, q.device, q.dtype)
             if combined_mask is not None:
-                combined_mask = combined_mask + sw_mask  # Combine additive masks
+                # Convert user mask to additive format if boolean, then combine with logical AND
+                if combined_mask.dtype == torch.bool:
+                    combined_mask = combined_mask.float().masked_fill(~combined_mask, float("-inf"))
+                combined_mask = torch.minimum(combined_mask, sw_mask)  # AND: both must allow
             else:
                 combined_mask = sw_mask
 

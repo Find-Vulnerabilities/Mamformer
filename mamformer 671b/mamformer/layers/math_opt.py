@@ -155,11 +155,14 @@ class EntropyRouter(nn.Module):
         # When entropy is low (near-collapse), add more noise to encourage exploration
         # When entropy is high (diverse), keep logits mostly unchanged
         # Formula: logits_mixed = (1 - γ·(1-H)) * logits + γ·(1-H) * noise
-        noise = torch.randn_like(logits) * 0.1  # Small Gaussian noise
         entropy_deficit = 1.0 - normalized_entropy  # High when routing is too deterministic
         mix_ratio = self.entropy_weight * entropy_deficit.unsqueeze(-1)
         mix_ratio = torch.clamp(mix_ratio, 0.0, 0.3)  # Max 30% noise
-        scores_with_bonus = (1.0 - mix_ratio) * logits + mix_ratio * noise
+        if self.training:
+            noise = torch.randn_like(logits) * 0.1  # Small Gaussian noise
+            scores_with_bonus = (1.0 - mix_ratio) * logits + mix_ratio * noise
+        else:
+            scores_with_bonus = logits  # Deterministic at inference
 
         aux_info = {
             "entropy_mean": entropy.mean().item(),

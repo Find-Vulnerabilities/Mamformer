@@ -22,7 +22,8 @@ from mamformer.layers.attention import GroupedQueryAttention
 from mamformer.layers.mamba2 import Mamba2Block, selective_scan
 from mamformer.layers.ffn import SwiGLUFFN, GEGLUFFN, StandardFFN
 from mamformer.layers.hybrid import MamformerBlock
-from mamformer.layers.moe import DeepSeekMoE
+from mamformer.layers.moe import DeepSeekMoE, MoERouter
+from mamformer.layers.st_moe import SpaceTimeMoE
 from mamformer.layers.dsa import DifferentialStateAttention
 from mamformer.layers.mtp import MultiTokenPredictor
 from mamformer.layers.math_opt import (
@@ -47,6 +48,8 @@ __all__ = [
     "GEGLUFFN",
     "StandardFFN",
     "DeepSeekMoE",
+    "MoERouter",
+    "SpaceTimeMoE",
     # Hybrid block
     "MamformerBlock",
     # MTP

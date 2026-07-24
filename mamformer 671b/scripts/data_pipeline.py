@@ -330,7 +330,7 @@ class Deduplicator:
         """Compute MinHash signature for a document."""
         words = text.lower().split()
         if len(words) < 20:
-            return [hash(text) % (2**32)] * self.num_hashes
+            return [int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)] * self.num_hashes
 
         # Simple MinHash: use n-grams with multiple hash functions
         n = 5
@@ -339,7 +339,7 @@ class Deduplicator:
         for i in range(len(words) - n + 1):
             gram = " ".join(words[i:i + n])
             for j in range(self.num_hashes):
-                h = hash(f"{j}:{gram}") % (2**32)
+                h = int(hashlib.sha256(f"{j}:{gram}".encode()).hexdigest()[:8], 16)
                 if h < sig[j]:
                     sig[j] = h
 
@@ -503,12 +503,12 @@ class DataMixer:
         """Get current document count per domain."""
         return dict(self._domain_counts)
 
-    def get_all_documents(self, shuffle: bool = True) -> Iterator[Tuple[str, str, float]]:
+    def get_all_documents(self, shuffle: bool = True) -> Iterator[Tuple[str, str]]:
         """
         Iterate over all documents with domain labels.
         If shuffle=True, interleaves domains randomly.
+        Yields (domain, text) pairs. Quality scores are tracked internally.
         """
-        # Build list of (domain, text) pairs
         all_docs = []
         for domain, texts in self._domain_buffers.items():
             for text in texts:

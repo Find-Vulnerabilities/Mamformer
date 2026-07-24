@@ -82,7 +82,9 @@ class ReflectionModule(nn.Module):
         # Generates critique tokens that describe issues found
         self.critique_head = nn.Linear(d_model, vocab_size, bias=False)
         if embedding_weight is not None:
-            self.critique_head.weight = embedding_weight  # Tie embeddings
+            # Properly tie embeddings: avoid direct weight assignment
+            # which does not register the tensor as a nn.Parameter
+            self.critique_head.weight = nn.Parameter(embedding_weight.data.clone())
 
         # ── Refinement Adapter ──────────────────────────────────
         # Takes the reflection summary and original hidden states
@@ -96,7 +98,7 @@ class ReflectionModule(nn.Module):
         # ── Refinement Head ─────────────────────────────────────
         self.refine_head = nn.Linear(d_model, vocab_size, bias=False)
         if embedding_weight is not None:
-            self.refine_head.weight = embedding_weight  # Tie embeddings
+            self.refine_head.weight = nn.Parameter(embedding_weight.data.clone())
 
         # ── Confidence Scorer ───────────────────────────────────
         # Predicts whether reflection actually improved quality
@@ -297,8 +299,8 @@ class SelfReflectiveGenerator:
         )
 
         # Get hidden states for the generated portion
-        outputs = self.model(input_ids=initial_output, use_cache=False)
-        hidden_states = outputs["logits"]  # Will be hidden states in full implementation
+        outputs = self.model.model(input_ids=initial_output, use_cache=False)
+        hidden_states = outputs["last_hidden_state"]  # (batch, seqlen, d_model)
 
         # ── Step 2: Reflection ──────────────────────────────────
         # For efficiency: only reflect on the generated part

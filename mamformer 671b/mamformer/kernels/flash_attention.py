@@ -246,8 +246,9 @@ def flash_attn_dsa(
         softmax_scale=softmax_scale,
     )
 
-    # Differential combination: A1 - lambda * A2
-    return attn_out_1 - lam * attn_out_2
+    # Differential combination: A1 - lambda * A2, with (1-lambda) normalization
+    # as in Differential Transformer paper (Ye et al., 2024)
+    return (attn_out_1 - lam * attn_out_2) / (1.0 - lam + 1e-8)
 
 
 # ── Sliding Window Mask ──────────────────────────────────────────────

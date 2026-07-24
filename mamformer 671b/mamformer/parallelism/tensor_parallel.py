@@ -680,7 +680,12 @@ def shard_model_tp(model: nn.Module, tp_size: int) -> nn.Module:
         Model with TP layers (same object, modified in-place)
     """
     # TP is handled at construction time via TPAttention, TPMamba2Block, etc.
-    # For already-constructed models, we'd need to replace layers.
-    # This function provides the interface for future use.
-    # Currently, TP is applied by constructing the model with TP wrappers.
+    # For already-constructed models, TP layer replacement is not yet implemented.
+    # Either construct the model with TP wrappers directly, or implement
+    # layer-by-layer replacement here.
+    if tp_size > 1:
+        raise NotImplementedError(
+            f"Retroactive TP sharding (tp_size={tp_size}) is not yet implemented. "
+            "Construct the model with TP wrappers at init time instead."
+        )
     return model

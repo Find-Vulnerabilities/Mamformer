@@ -32,6 +32,56 @@ from collections import deque
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# Autograd Communication Primitives
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _SendForward(torch.autograd.Function):
+    """Autograd function for pipeline forward send. In backward, receives gradients."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, dst: int, group) -> torch.Tensor:
+        ctx.dst = dst
+        ctx.group = group
+        ctx.shape = tensor.shape
+        if group is not None and dist.is_initialized():
+            dist.send(tensor.contiguous(), dst, group=group)
+        return tensor  # Pass through on sender side
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.group is not None and dist.is_initialized():
+            grad_input = torch.empty(ctx.shape, device=grad_output.device, dtype=grad_output.dtype)
+            dist.recv(grad_input, ctx.dst, group=ctx.group)
+            return grad_input, None, None
+        return grad_output, None, None
+
+
+class _RecvForward(torch.autograd.Function):
+    """Autograd function for pipeline forward recv. In backward, sends gradients upstream.
+
+    Accepts a dummy tensor (grad_trigger) that requires grad. This ensures the autograd
+    engine calls backward() even though the actual received tensor has no grad history.
+    """
+
+    @staticmethod
+    def forward(ctx, shape: tuple, src: int, group, device, dtype, grad_trigger: torch.Tensor) -> torch.Tensor:
+        ctx.src = src
+        ctx.group = group
+        if group is not None and dist.is_initialized():
+            tensor = torch.empty(shape, device=device, dtype=dtype)
+            dist.recv(tensor, src, group=group)
+            return tensor
+        return torch.empty(shape, device=device, dtype=dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.group is not None and dist.is_initialized():
+            dist.send(grad_output.contiguous(), ctx.src, group=ctx.group)
+        return None, None, None, None, None, None  # shape, src, group, device, dtype, grad_trigger
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Pipeline Stage
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -313,26 +363,23 @@ class PipelineScheduler1F1B:
         return None
 
     def _send_forward(self, tensor: torch.Tensor, mb_idx: int):
-        """Send hidden states to next pipeline stage. Ordering-based protocol (no tags — NCCL compatible)."""
+        """Send hidden states to next stage with autograd tracking for backward gradient flow."""
         if self.pp_group is not None and dist.is_initialized():
             dst = self.rank + 1
-            # Ordering guarantee: shape → data, sender matches receiver order
-            shape_tensor = torch.tensor(tensor.shape, dtype=torch.long, device=tensor.device)
-            dist.send(shape_tensor, dst, group=self.pp_group)
-            dist.send(tensor.contiguous(), dst, group=self.pp_group)
+            return _SendForward.apply(tensor, dst, self.pp_group)
+        return tensor
 
     def _recv_forward(self, mb_size: int, seq_len: int, d_model: int) -> torch.Tensor:
-        """Receive hidden states from previous pipeline stage. Matches _send_forward ordering."""
+        """Receive hidden states from previous stage with autograd tracking for backward."""
         if self.pp_group is not None and dist.is_initialized():
             src = self.rank - 1
-            shape_tensor = torch.empty(3, dtype=torch.long, device=torch.cuda.current_device())
-            dist.recv(shape_tensor, src, group=self.pp_group)
-            recv_batch, recv_seq, recv_d = shape_tensor.tolist()
-            tensor = torch.empty(recv_batch, recv_seq, recv_d,
-                                device=torch.cuda.current_device(), dtype=torch.float32)
-            dist.recv(tensor, src, group=self.pp_group)
-            return tensor
-        return torch.empty(mb_size, seq_len, d_model, device=torch.cuda.current_device())
+            device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+            # Dummy tensor requiring grad ensures autograd engine calls backward()
+            grad_trigger = torch.zeros(1, device=device, requires_grad=True)
+            return _RecvForward.apply(
+                (mb_size, seq_len, d_model), src, self.pp_group, device, torch.float32, grad_trigger
+            )
+        return torch.empty(mb_size, seq_len, d_model)
 
     def _send_backward(self, mb_idx: int):
         """Send gradient completion signal to previous stage for 1F1B synchronization."""

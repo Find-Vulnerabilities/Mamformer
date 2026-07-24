@@ -322,38 +322,44 @@ class LinearDiffAttention(nn.Module):
         v: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Parallel (training) linear attention: O(N) via matrix product reordering.
+        Causal parallel linear attention: O(N) via cumulative sums.
 
-        Computes: Output = (φ(Q) @ (φ(K)^T @ V)) / (φ(Q) @ sum(φ(K)^T))
+        Standard linear attention computes global (non-causal) KV products.
+        For autoregressive language modeling, we MUST enforce causality:
+        position t can only attend to positions ≤ t.
 
-        Then applies differential: DiffOutput = Output₁ - λ·Output₂
+        We implement this using cumulative sums over the sequence dimension:
+          KV_cum[t] = Σ_{j=0}^{t} φ(k_j)^T ⊗ v_j
+          z_cum[t]  = Σ_{j=0}^{t} φ(k_j)^T
+          out[t] = φ(q_t) @ KV_cum[t] / (φ(q_t) @ z_cum[t])
         """
-        # φ(K)^T: (B, H, kernel_dim, S)
-        k_phi_t = k_phi.transpose(-2, -1)
+        # k_phi: (B, H, S, K), v: (B, H, S, D)
+        # Build KV products: (B, H, S, K, D)
+        k_phi_expanded = k_phi.unsqueeze(-1)  # (B, H, S, K, 1)
+        v_expanded = v.unsqueeze(-2)          # (B, H, S, 1, D)
+        kv_outer = k_phi_expanded * v_expanded  # (B, H, S, K, D)
 
-        # KV product: (B, H, kernel_dim, head_dim)
-        KV = torch.matmul(k_phi_t, v)
+        # Causal cumulative sums (only past + present, no future)
+        KV_cum = torch.cumsum(kv_outer, dim=2)  # (B, H, S, K, D)
+        z_cum = torch.cumsum(k_phi, dim=2)      # (B, H, S, K)
 
-        # Normalizer: (B, H, kernel_dim, 1)
-        z = k_phi_t.sum(dim=-1, keepdim=True)
-
-        # ── Output 1 ────────────────────────────────────────────────
-        # φ(Q₁) @ KV: (B, H, S, head_dim)
-        out1 = torch.matmul(q1_phi, KV)
-        # Normalizer: φ(Q₁) @ z: (B, H, S, 1)
-        norm1 = torch.matmul(q1_phi, z)
+        # ── Output 1 ──
+        # φ(Q₁) @ KV_cum: (B, H, S, D)
+        out1 = torch.einsum('bhsk,bhskd->bhsd', q1_phi, KV_cum)
+        # φ(Q₁) @ z_cum: (B, H, S, 1)
+        norm1 = torch.einsum('bhsk,bhsk->bhs', q1_phi, z_cum).unsqueeze(-1)
         out1 = out1 / (norm1 + 1e-8)
 
-        # ── Output 2 ────────────────────────────────────────────────
-        out2 = torch.matmul(q2_phi, KV)
-        norm2 = torch.matmul(q2_phi, z)
+        # ── Output 2 ──
+        out2 = torch.einsum('bhsk,bhskd->bhsd', q2_phi, KV_cum)
+        norm2 = torch.einsum('bhsk,bhsk->bhs', q2_phi, z_cum).unsqueeze(-1)
         out2 = out2 / (norm2 + 1e-8)
 
-        # ── Differential combination ────────────────────────────────
+        # ── Differential combination ──
         lam = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
         lam = torch.clamp(lam, max=0.99)
 
-        diff_output = out1 - lam * out2  # (B, H, S, head_dim)
+        diff_output = out1 - lam * out2  # (B, H, S, D)
         diff_output = diff_output / (1.0 - lam + 1e-8)
 
         return diff_output
@@ -852,20 +858,29 @@ class KDADiffAttention(nn.Module):
         else:
             self.interleave_gate = None
 
-        # ── Output projection (shared between linear and full) ──────
-        # Both sub-modules have their own o_proj; this is the final blend
-        self.output_mix = nn.Parameter(torch.zeros(1))  # sigmoid(0) = 0.5 blend
+        # ── Output blend weight (used for soft dynamic gating) ──────
+        # sigmoid(0) = 0.5 — balanced initial blend between linear and full
+        self.output_mix = nn.Parameter(torch.zeros(1))
 
-        # ── Layer index (set externally by MamformerBlock) ───────────
+        # ── Layer indices (set externally by MamformerBlock) ──────────
         self.register_buffer("layer_idx", torch.tensor(0, dtype=torch.long))
+        # attn_layer_idx: counts only among attention layers, used for the
+        # fixed 3:1 interleaving pattern in cross_layer mode. When set to
+        # a non-negative value, it overrides layer_idx for pattern decisions.
+        self.register_buffer("attn_layer_idx", torch.tensor(-1, dtype=torch.long))
 
-    def set_layer_idx(self, idx: int) -> None:
-        """Set the layer index for fixed interleaving pattern."""
+    def set_layer_idx(self, idx: int, attn_idx: int = -1) -> None:
+        """Set layer indices. attn_idx is the attention-layer counter for cross_layer mode."""
         self.layer_idx.fill_(idx)
+        if attn_idx >= 0:
+            self.attn_layer_idx.fill_(attn_idx)
 
     def _is_full_attention_layer(self) -> bool:
-        """Check if this layer should use full attention (fixed pattern)."""
-        return (self.layer_idx.item() + 1) % (self.linear_ratio + 1) == 0
+        """Check if this layer should use full attention (fixed pattern).
+        Uses attn_layer_idx if set, otherwise falls back to global layer_idx.
+        This ensures the 3:1 pattern is maintained in cross_layer mode."""
+        idx = self.attn_layer_idx.item() if self.attn_layer_idx.item() >= 0 else self.layer_idx.item()
+        return (idx + 1) % (self.linear_ratio + 1) == 0
 
     def forward(
         self,

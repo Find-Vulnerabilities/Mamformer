@@ -177,10 +177,10 @@ class DifferentialStateAttention(nn.Module):
 
         if self.use_state_injection:
             # Smaller init for state injection (start near identity)
-            for proj in [self.state_k_proj, self.state_v_proj]:
-                for layer in proj:
-                    if isinstance(layer, nn.Linear):
-                        nn.init.normal_(layer.weight, mean=0.0, std=0.01)
+            for seq_module in [self.state_k_proj, self.state_v_proj]:
+                for submodule in seq_module:
+                    if isinstance(submodule, nn.Linear):
+                        nn.init.normal_(submodule.weight, mean=0.0, std=0.01)
             nn.init.normal_(self.h_state_k_proj.weight, mean=0.0, std=0.01)
             nn.init.normal_(self.h_state_v_proj.weight, mean=0.0, std=0.01)
 

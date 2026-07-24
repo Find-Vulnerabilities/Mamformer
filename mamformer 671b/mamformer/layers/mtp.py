@@ -275,6 +275,8 @@ class MultiTokenPredictor(nn.Module):
                         ignore_index=-100,
                     )
                     mtp_losses.append(loss_k)
+                # else: seq_len too short for this depth — silently skip
+                # (handled naturally: fewer loss terms for short sequences)
 
             # Update current representation for next depth
             h_current = h_k

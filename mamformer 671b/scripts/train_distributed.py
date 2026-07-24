@@ -198,7 +198,14 @@ def train_distributed(config: dict) -> None:
     log_every = config.get("log_every", 10)
     output_dir = Path(config.get("output_dir", "./checkpoints"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    amp_dtype = torch.bfloat16 if config.get("bf16", False) else torch.float16
+    use_bf16 = config.get("bf16", False)
+    use_fp16 = config.get("fp16", False)
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+    elif use_fp16:
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32  # Safe default — no mixed precision unless requested
 
     # ── WandB ────────────────────────────────────────────────────
     use_wandb = config.get("use_wandb", False) and global_rank == 0
@@ -255,9 +262,15 @@ def train_distributed(config: dict) -> None:
 
         tokens_processed += input_ids.numel()
 
-        # Collect MoE load stats for diagnostics (guard against PP sharding)
+        # Collect MoE load stats for diagnostics.
+        # Guard: after PP sharding, model.model.layers may not exist.
         if moe_aux_info := outputs.get("moe_aux_info"):
-            if hasattr(model, 'model') and hasattr(model.model, 'layers') and model_config.moe.enabled:
+            can_collect = (
+                model_config.moe.enabled
+                and hasattr(model, 'model')
+                and hasattr(model.model, 'layers')
+            )
+            if can_collect:
                 for layer_idx, layer in enumerate(model.model.layers):
                     if hasattr(layer, 'ffn') and hasattr(layer.ffn, '_expert_counts'):
                         expert_counts = layer.ffn._expert_counts.float()

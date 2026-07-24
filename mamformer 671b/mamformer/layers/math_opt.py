@@ -73,13 +73,15 @@ class DynamicGate(nn.Module):
         Returns:
             gate: (d_model,) — values in (0, 1) for per-dimension fusion
         """
-        # Pool over batch and sequence for global context
-        pooled = x.mean(dim=(0, 1))  # (d_model,)
+        # Pool over sequence dimension for per-sample context
+        # (batch, d_model) — each sample gets its own gate
+        pooled = x.mean(dim=1)  # (batch, d_model)
         # Normalize to unit norm for stability
         pooled = F.normalize(pooled.unsqueeze(0), dim=-1).squeeze(0)
         # MLP → sigmoid
         gate = torch.sigmoid(self.mlp(pooled))
-        return gate
+        # Take mean across batch for shape compatibility: (d_model,)
+        return gate.mean(dim=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════

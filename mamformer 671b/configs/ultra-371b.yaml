@@ -39,10 +39,16 @@ model:
     bias_update_speed: 0.001
 
   dsa:
-    enabled: true
+    enabled: false                     # Disabled — KDA-Diff supersedes DSA
     lambda_init: 0.8
     use_state_injection: true
     state_injection_dim: 64
+  kda_diff:
+    enabled: true
+    linear_ratio: 3
+    kernel_dim: 128
+    latent_dim: 512
+    use_dynamic_ratio: true
 
   mtp:
     enabled: true
@@ -52,10 +58,11 @@ model:
   # Interleaved Attention: 1:3 ratio (13 hybrid / 33 SSM-only)
   interleave:
     enabled: true
-    pattern: "attn_every_k"
+    pattern: "cross_layer"
     attn_every_k: 4
     first_layer_attn: true
     last_layers_dense: 2
+    fusion_layers: [44, 45]
 
   rope:
     theta: 20000000.0           # 20M theta for 256K

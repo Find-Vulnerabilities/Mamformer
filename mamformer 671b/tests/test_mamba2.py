@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 import torch
+import torch.nn.functional as F
 from mamformer.layers.mamba2 import (
     Mamba2Block,
     selective_scan,
@@ -160,6 +161,3 @@ class TestMamba2Block:
         assert cache is not None
         assert out.shape == x.shape
 
-
-# Import needed for test class
-import torch.nn.functional as F

@@ -177,9 +177,10 @@ class RotaryEmbedding(nn.Module):
         Returns:
             (cos, sin) each of shape (1, 1, seq_len, head_dim)
         """
-        # Check cache
+        # Check cache (with LRU promotion on hit)
         cache_key = (seq_len, offset)
         if cache_key in self._cache:
+            self._cache.move_to_end(cache_key)
             return self._cache[cache_key]
 
         # Compute dynamically

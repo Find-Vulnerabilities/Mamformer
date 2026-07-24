@@ -138,11 +138,12 @@ class GroupedQueryAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        # Handle KV cache
+        # Handle KV cache — capture kv_len AFTER cache concatenation
         if use_cache and cache is not None:
             k = torch.cat([cache["k"], k], dim=2)
             v = torch.cat([cache["v"], v], dim=2)
 
+        kv_len = k.shape[2]  # Total KV length after cache concatenation
         new_cache = {"k": k, "v": v} if use_cache else None
 
         # Repeat KV heads to match Q heads (GQA)
@@ -153,7 +154,7 @@ class GroupedQueryAttention(nn.Module):
         # Build combined mask: causal + sliding window + user-provided
         combined_mask = attention_mask
         if self.sliding_window > 0:
-            sw_mask = self._build_sliding_window_mask(seq_len, q.device, q.dtype)
+            sw_mask = self._build_sliding_window_mask(seq_len, kv_len, q.device, q.dtype)
             if combined_mask is not None:
                 # Convert user mask to additive format if boolean, then combine with logical AND
                 if combined_mask.dtype == torch.bool:
@@ -188,27 +189,29 @@ class GroupedQueryAttention(nn.Module):
         return output, new_cache
 
     def _build_sliding_window_mask(
-        self, seq_len: int, device: torch.device, dtype: torch.dtype
+        self, q_len: int, kv_len: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         """
         Build a causal + sliding window attention mask.
 
-        Position i can attend to positions in [max(0, i-W+1), i].
-        Shape: (1, 1, seq_len, seq_len), additive mask (0=attend, -inf=mask)
-        """
-        # Distance matrix: distances[i,j] = i - j
-        indices = torch.arange(seq_len, device=device)
-        distances = indices.unsqueeze(1) - indices.unsqueeze(0)  # (seq_len, seq_len)
+        Position i can attend to positions in [i+offset-W+1, i+offset]
+        where offset = kv_len - q_len (accounting for KV cache).
 
-        # Valid: upper bound = causal (i >= j → distance >= 0)
-        #         lower bound = window (i - j < sliding_window → distance < W)
+        Shape: (1, 1, q_len, kv_len), additive mask (0=attend, -inf=mask)
+        """
+        offset = kv_len - q_len
+        indices_q = torch.arange(q_len, device=device).unsqueeze(1)  # (q_len, 1)
+        indices_k = torch.arange(kv_len, device=device).unsqueeze(0)  # (1, kv_len)
+
+        # Distance from query i to key j: key_pos - query_pos
+        # Valid: causal (key_pos <= query_pos) AND within window
+        distances = indices_k - indices_q  # (q_len, kv_len)
         valid = (distances >= 0) & (distances < self.sliding_window)
 
-        # Convert to additive mask: 0 = attend, -inf = mask
-        mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
+        mask = torch.zeros(q_len, kv_len, device=device, dtype=dtype)
         mask = mask.masked_fill(~valid, float("-inf"))
 
-        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+        return mask.unsqueeze(0).unsqueeze(0)  # (1, 1, q_len, kv_len)
 
     def extra_repr(self) -> str:
         sw_info = f", sliding_window={self.sliding_window}" if self.sliding_window > 0 else ""

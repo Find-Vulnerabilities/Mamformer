@@ -26,7 +26,14 @@ import torch.nn.functional as F
 
 @dataclass
 class GenerationConfig:
-    """Configuration for text generation."""
+    """Runtime configuration for text generation.
+
+    NOTE: This class controls runtime sampling parameters (temperature, top_k, etc.).
+    For model-level context/output limits, see mamformer.config.GenerationConfig.
+    The two classes have the same name but serve different purposes:
+      - config.py::GenerationConfig = model tier defaults (max_context, max_output)
+      - generation.py::GenerationConfig = runtime sampling params (temperature, beams)
+    """
 
     # Decoding strategy
     max_new_tokens: int = 256
@@ -290,7 +297,8 @@ class GenerationMixin:
 
         # Beam scores: (batch_size * num_beams,)
         beam_scores = torch.zeros(batch_size * num_beams, device=device)
-        beam_scores[1::num_beams] = -1e9  # Disable redundant beams initially
+        # For each batch item, only the first beam is active initially
+        beam_scores.view(batch_size, num_beams)[:, 1:] = -1e9
 
         generated = input_ids
         cache = None
@@ -354,7 +362,7 @@ class GenerationMixin:
 
             # End if all beams hit EOS
             if config.eos_token_id is not None:
-                if (next_token_indices[best_indices] == config.eos_token_id).all():
+                if (next_token_indices[best_indices_global] == config.eos_token_id).all():
                     break
 
         # Return best sequence for each batch item
@@ -374,11 +382,24 @@ class GenerationMixin:
             new_layer = {}
             for key, val in layer_cache.items():
                 if isinstance(val, dict):
-                    new_layer[key] = {k: v[indices] if v is not None else None
-                                     for k, v in val.items()}
+                    # Recursively reorder nested dict values
+                    reordered = {}
+                    for k, v in val.items():
+                        if isinstance(v, torch.Tensor):
+                            reordered[k] = v[indices]
+                        elif v is not None and isinstance(v, (list, tuple)):
+                            reordered[k] = type(v)(
+                                item[indices] if isinstance(item, torch.Tensor) else item
+                                for item in v
+                            )
+                        else:
+                            # Scalars, strings, etc. — pass through unchanged
+                            reordered[k] = v
+                    new_layer[key] = reordered
                 elif isinstance(val, torch.Tensor):
                     new_layer[key] = val[indices]
                 else:
+                    # Non-tensor metadata (e.g., ssm_h_states=None, moe_aux_info scalars)
                     new_layer[key] = val
             new_cache.append(new_layer)
         return new_cache
@@ -408,6 +429,8 @@ class GenerationMixin:
 
         config = generation_config
         device = input_ids.device
+        if input_ids.shape[0] != 1:
+            raise ValueError(f"generate_stream only supports batch_size=1, got {input_ids.shape[0]}")
         generated = input_ids
         cache = None
 

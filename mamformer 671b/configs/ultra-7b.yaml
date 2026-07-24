@@ -46,10 +46,16 @@ model:
 
   # DSA: Differential State-Aware Attention
   dsa:
+    enabled: false                     # Disabled — KDA-Diff supersedes DSA
+    lambda_init: 0.8
+    use_state_injection: true
+    state_injection_dim: 64
+  kda_diff:
     enabled: true
-    lambda_init: 0.8                   # λ = exp(0.8) ≈ 2.23 initial noise cancellation
-    use_state_injection: true          # Inject Mamba state into K/V
-    state_injection_dim: 64            # Bottleneck dimension for state injection
+    linear_ratio: 3
+    kernel_dim: 128
+    latent_dim: 512
+    use_dynamic_ratio: true
 
   # MTP: Multi-Token Prediction
   mtp:
@@ -61,10 +67,11 @@ model:
   # Interleaved Attention: 1:3 ratio (10 hybrid / 22 SSM-only)
   interleave:
     enabled: true
-    pattern: "attn_every_k"
+    pattern: "cross_layer"
     attn_every_k: 4
     first_layer_attn: true
     last_layers_dense: 2
+    fusion_layers: [30, 31]
 
   # RoPE settings
   rope:

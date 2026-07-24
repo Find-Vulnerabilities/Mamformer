@@ -161,37 +161,51 @@ class InterleaveConfig:
     """
     Layer-level attention interleaving configuration.
 
-    Controls which layers run full hybrid (Attention + SSM in parallel)
-    vs SSM-only. Reduces training/inference FLOPs by ~40-60% while
-    maintaining accuracy — all production hybrid LLMs (Jamba, Samba,
-    Zamba) use interleaving, not per-layer parallelism.
+    Controls which layers run attention, SSM, or both (fusion).
 
-    Pattern "attn_every_k":
-        Places one hybrid layer every K layers, with the first layer
-        and last N layers always hybrid. Example: k=4, n_layers=32
-        gives ~10 hybrid layers (1:3 ratio).
+    Pattern "attn_every_k" (original):
+        Places one HYBRID layer (Attention ∥ SSM in parallel) every K layers.
+        The hybrid layer runs both pathways simultaneously with gated fusion.
+
+    Pattern "cross_layer" (recommended):
+        Cross-layer interleaving — attention and SSM run in DIFFERENT layers.
+        SSM layers pass their hidden states forward to the next attention layer
+        via cross-layer state injection (SSM h_states → DSA/KDA-Diff K/V).
+        Fusion layers (specified by fusion_layers) keep the original parallel
+        design for final-stage deep fusion.
+
+        Advantages over original attn_every_k hybrid:
+          - 40-50% lower FLOPs per layer (each layer does one thing)
+          - Eliminates signal redundancy (attention and SSM see different
+            representational depths)
+          - Preserves SSM→Attention cross-pollination via cross-layer state
+          - More attention layers at same FLOP budget
 
     Pattern "custom":
         Explicit list of layer indices that should have attention.
     """
 
     enabled: bool = False
-    pattern: str = "attn_every_k"       # "attn_every_k" | "custom"
-    attn_every_k: int = 4               # Hybrid layer every K layers
+    pattern: str = "attn_every_k"       # "attn_every_k" | "cross_layer" | "custom"
+    attn_every_k: int = 4               # Hybrid/attention layer every K layers
     first_layer_attn: bool = True       # Layer 0 always has attention
     last_layers_dense: int = 2          # Last N layers all have attention
     attention_layers: list[int] = field(default_factory=list)  # "custom" explicit list
+    # Cross-layer / fusion settings
+    fusion_layers: list[int] = field(default_factory=list)  # Layers keeping parallel fusion
 
     def resolve_attention_layers(self, n_layers: int) -> list[int]:
         """
         Compute which layer indices have attention based on the pattern.
 
-        Returns a sorted list of layer indices that should be hybrid
-        (attention + SSM). All other layers are SSM-only.
+        For "attn_every_k": hybrid layers (attention + SSM in parallel).
+        For "cross_layer": attention-only layers (SSM injected from previous SSM layer).
+        For "custom": explicit list.
+
+        Returns a sorted list of layer indices with attention.
         """
         if self.pattern == "custom":
             layers = set(self.attention_layers)
-            # Safety: clamp to valid range
             layers = {i for i in layers if 0 <= i < n_layers}
             if not layers:
                 raise ValueError(
@@ -200,32 +214,114 @@ class InterleaveConfig:
                 )
             return sorted(layers)
 
-        # "attn_every_k" pattern
+        if self.pattern == "cross_layer":
+            return self._resolve_cross_layer_attention(n_layers)
+
+        # "attn_every_k" pattern (original hybrid)
+        layers: set[int] = set()
+        start = 0 if self.first_layer_attn else self.attn_every_k
+        for i in range(start, n_layers, self.attn_every_k):
+            layers.add(i)
+        if self.last_layers_dense > 0:
+            for i in range(max(0, n_layers - self.last_layers_dense), n_layers):
+                layers.add(i)
+        return sorted(layers)
+
+    def _resolve_cross_layer_attention(self, n_layers: int) -> list[int]:
+        """
+        Resolve attention layers for cross_layer pattern.
+
+        Logic:
+          1. Place attention layers every K layers (starting at layer 0)
+          2. Last N layers get attention (for output quality)
+          3. Fusion layers are the LAST entries in fusion_layers (parallel attn+SSM)
+             and are automatically included in attention layers
+          4. All other layers are SSM-only
+
+        Example (n_layers=52, attn_every_k=4, last_layers_dense=2,
+                fusion_layers=[48,49,50,51]):
+          Attention: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 49, 50, 51
+          Fusion:    48, 49, 50, 51 (last 4 are parallel fusion)
+          SSM-only:  everything else
+        """
         layers: set[int] = set()
 
-        # First layer always gets attention (important for embedding alignment)
-        if self.first_layer_attn:
-            layers.add(0)
-
-        # Every K layers
-        for i in range(0, n_layers, self.attn_every_k):
+        # Every K layers, respecting first_layer_attn flag
+        start = 0 if self.first_layer_attn else self.attn_every_k
+        for i in range(start, n_layers, self.attn_every_k):
             layers.add(i)
 
-        # Last N layers all have attention (critical for output quality)
+        # Last N layers dense attention
         if self.last_layers_dense > 0:
             for i in range(max(0, n_layers - self.last_layers_dense), n_layers):
                 layers.add(i)
 
+        # Fusion layers are always attention layers
+        for i in self.fusion_layers:
+            if 0 <= i < n_layers:
+                layers.add(i)
+
         return sorted(layers)
+
+    def resolve_fusion_layers(self, n_layers: int) -> set[int]:
+        """
+        Return the set of layer indices that should run parallel fusion
+        (Attention ∥ SSM + gate). Only meaningful for cross_layer pattern.
+
+        For attn_every_k: all attention layers are hybrid (fusion).
+        For cross_layer: only explicit fusion_layers are hybrid.
+        """
+        if self.pattern == "cross_layer":
+            return {i for i in self.fusion_layers if 0 <= i < n_layers}
+        # In attn_every_k mode, all attention layers are hybrid = fusion
+        return set(self.resolve_attention_layers(n_layers))
+
+    def resolve_layer_types(self, n_layers: int) -> list[dict]:
+        """
+        Resolve the complete layer-type configuration.
+
+        Returns a list of dicts, one per layer:
+          {"has_attention": bool, "has_ssm": bool, "is_fusion": bool}
+
+        cross_layer pattern:
+          - Attention layers: has_attention=True, has_ssm=False (except fusion)
+          - SSM-only layers: has_attention=False, has_ssm=True
+          - Fusion layers: has_attention=True, has_ssm=True (parallel)
+
+        attn_every_k pattern:
+          - Hybrid layers: has_attention=True, has_ssm=True (both are fusion)
+          - SSM-only layers: has_attention=False, has_ssm=True
+        """
+        attn_set = set(self.resolve_attention_layers(n_layers))
+        fusion_set = self.resolve_fusion_layers(n_layers)
+
+        result = []
+        for i in range(n_layers):
+            has_attn = i in attn_set
+            is_fusion = i in fusion_set
+            # In cross_layer: SSM-only layers have SSM, attention-only don't (unless fusion)
+            # In attn_every_k: all attention layers have SSM (hybrid), SSM-only layers have SSM
+            if self.pattern == "cross_layer":
+                has_ssm = (not has_attn) or is_fusion
+            else:
+                has_ssm = True  # All layers have SSM in attn_every_k mode
+
+            result.append({
+                "has_attention": has_attn,
+                "has_ssm": has_ssm,
+                "is_fusion": is_fusion,
+            })
+        return result
 
 
 @dataclass
 class GenerationConfig:
     """
-    Generation limits and defaults.
+    Model-level generation limits and defaults (stored in model config).
 
-    These are stored in the model config so each tier knows its
-    supported context window and maximum output length.
+    Each model tier records its supported context window and output length
+    here. For runtime generation parameters (temperature, top_k, etc.),
+    see generation.py's GenerationConfig (runtime-level).
     """
 
     max_context: int = 8192          # Maximum sequence length the model supports
@@ -473,10 +569,17 @@ class MamformerConfig:
             "dsa_use_state_injection": self.dsa.use_state_injection,
             "dsa_state_injection_dim": self.dsa.state_injection_dim,
             "dsa_num_attn_groups": self.dsa.num_attn_groups,
+            # KDA-Diff
+            "kda_diff_enabled": self.kda_diff.enabled,
+            "kda_diff_linear_ratio": self.kda_diff.linear_ratio,
+            "kda_diff_kernel_dim": self.kda_diff.kernel_dim,
+            "kda_diff_latent_dim": self.kda_diff.latent_dim,
+            "kda_diff_use_dynamic_ratio": self.kda_diff.use_dynamic_ratio,
             # MTP
             "mtp_enabled": self.mtp.enabled,
             "mtp_depth": self.mtp.depth,
             "mtp_loss_weight": self.mtp.loss_weight,
+            "mtp_d_model": self.mtp.mtp_d_model,
             # ST-MoE
             "st_moe_enabled": self.st_moe.enabled,
             "st_moe_lambda_init": self.st_moe.lambda_init,
@@ -496,6 +599,7 @@ class MamformerConfig:
             "interleave_first_layer_attn": self.interleave.first_layer_attn,
             "interleave_last_layers_dense": self.interleave.last_layers_dense,
             "interleave_attention_layers": self.interleave.attention_layers,
+            "interleave_fusion_layers": self.interleave.fusion_layers,
             # Generation
             "gen_max_context": self.generation.max_context,
             "gen_max_output_tokens": self.generation.max_output_tokens,
@@ -548,6 +652,13 @@ class MamformerConfig:
             state_injection_dim=d.get("dsa_state_injection_dim", 64),
             num_attn_groups=d.get("dsa_num_attn_groups", 2),
         )
+        kda_diff_cfg = KDADiffConfig(
+            enabled=d.get("kda_diff_enabled", False),
+            linear_ratio=d.get("kda_diff_linear_ratio", 3),
+            kernel_dim=d.get("kda_diff_kernel_dim", 128),
+            latent_dim=d.get("kda_diff_latent_dim", 512),
+            use_dynamic_ratio=d.get("kda_diff_use_dynamic_ratio", True),
+        )
         mtp_cfg = MTPConfig(
             enabled=d.get("mtp_enabled", False),
             depth=d.get("mtp_depth", 2),
@@ -575,6 +686,7 @@ class MamformerConfig:
             first_layer_attn=d.get("interleave_first_layer_attn", True),
             last_layers_dense=d.get("interleave_last_layers_dense", 2),
             attention_layers=d.get("interleave_attention_layers", []),
+            fusion_layers=d.get("interleave_fusion_layers", []),
         )
         gen_cfg = GenerationConfig(
             max_context=d.get("gen_max_context", d.get("max_seq_len", 8192)),
@@ -598,7 +710,7 @@ class MamformerConfig:
             use_sliding_window=d.get("use_sliding_window", False),
             sliding_window=d.get("sliding_window", 4096),
             mamba=mamba_cfg, rope=rope_cfg, moe=moe_cfg,
-            dsa=dsa_cfg, mtp=mtp_cfg, st_moe=st_moe_cfg,
+            dsa=dsa_cfg, kda_diff=kda_diff_cfg, mtp=mtp_cfg, st_moe=st_moe_cfg,
             communicative_moe=comm_moe_cfg,
             interleave=interleave_cfg,
             generation=gen_cfg,
@@ -640,6 +752,12 @@ class MamformerConfig:
                         {"enabled": "dsa_enabled", "lambda_init": "dsa_lambda_init",
                          "use_state_injection": "dsa_use_state_injection",
                          "state_injection_dim": "dsa_state_injection_dim"})
+        _flatten_nested(d, "kda_diff",
+                        {"enabled": "kda_diff_enabled",
+                         "linear_ratio": "kda_diff_linear_ratio",
+                         "kernel_dim": "kda_diff_kernel_dim",
+                         "latent_dim": "kda_diff_latent_dim",
+                         "use_dynamic_ratio": "kda_diff_use_dynamic_ratio"})
         _flatten_nested(d, "mtp",
                         {"enabled": "mtp_enabled", "depth": "mtp_depth",
                          "loss_weight": "mtp_loss_weight"})
@@ -661,7 +779,8 @@ class MamformerConfig:
                          "attn_every_k": "interleave_attn_every_k",
                          "first_layer_attn": "interleave_first_layer_attn",
                          "last_layers_dense": "interleave_last_layers_dense",
-                         "attention_layers": "interleave_attention_layers"})
+                         "attention_layers": "interleave_attention_layers",
+                         "fusion_layers": "interleave_fusion_layers"})
         _flatten_nested(d, "generation",
                         {"max_context": "gen_max_context",
                          "max_output_tokens": "gen_max_output_tokens",
@@ -732,6 +851,10 @@ class MamformerConfig:
             ]
         if self.dsa.enabled:
             lines.append(f"  DSA:             ENABLED (lambda={self.dsa.lambda_init})")
+        if self.kda_diff.enabled:
+            lines.append(f"  KDA-Diff:        ENABLED ({self.kda_diff.linear_ratio}:1 linear:full, "
+                         f"kernel={self.kda_diff.kernel_dim}, latent={self.kda_diff.latent_dim}, "
+                         f"dynamic={'on' if self.kda_diff.use_dynamic_ratio else 'off'})")
         if self.mtp.enabled:
             lines.append(f"  MTP:             ENABLED (depth={self.mtp.depth})")
         if self.st_moe.enabled:
@@ -740,8 +863,17 @@ class MamformerConfig:
             lines.append(f"  CommunicativeMoE:ENABLED ({self.communicative_moe.n_comm_heads} heads, depth={self.communicative_moe.comm_depth})")
         if self.interleave.enabled:
             attn_layers = self.interleave.resolve_attention_layers(self.n_layers)
-            lines.append(f"  Interleave:       ENABLED ({len(attn_layers)}/{self.n_layers} hybrid, "
-                         f"{self.n_layers - len(attn_layers)} SSM-only, "
+            layer_types = self.interleave.resolve_layer_types(self.n_layers)
+            n_fusion = sum(1 for lt in layer_types if lt["is_fusion"])
+            n_attn_only = sum(1 for lt in layer_types if lt["has_attention"] and not lt["is_fusion"])
+            n_ssm_only = sum(1 for lt in layer_types if not lt["has_attention"] and lt["has_ssm"])
+            parts = [f"{len(attn_layers)}/{self.n_layers} attn"]
+            if n_fusion > 0:
+                parts.append(f"{n_fusion} fusion (parallel)")
+            if n_attn_only > 0:
+                parts.append(f"{n_attn_only} attn-only (cross-layer)")
+            parts.append(f"{n_ssm_only} SSM-only")
+            lines.append(f"  Interleave:       ENABLED ({', '.join(parts)}, "
                          f"pattern={self.interleave.pattern})")
         if self.rope.use_yarn:
             lines.append(f"  YaRN:            scale={self.rope.yarn_scale}x, theta={self.rope.theta}")
@@ -802,10 +934,12 @@ def _make_ultra_7b() -> MamformerConfig:
         moe=MoEConfig(enabled=True, n_shared_experts=2, shared_expert_intermediate_dim=2304,
                        n_routed_experts=128, top_k=8, expert_intermediate_dim=576,
                        aux_loss_free=True, bias_update_speed=0.001),
-        dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        dsa=DSAConfig(enabled=False, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        kda_diff=KDADiffConfig(enabled=True, linear_ratio=3, kernel_dim=128, latent_dim=512, use_dynamic_ratio=True),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
-        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
-                                     first_layer_attn=True, last_layers_dense=2),
+        interleave=InterleaveConfig(enabled=True, pattern="cross_layer", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2,
+                                     fusion_layers=[30, 31]),
         generation=GenerationConfig(max_context=8192, max_output_tokens=4096,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -825,10 +959,12 @@ def _make_ultra_37b() -> MamformerConfig:
         moe=MoEConfig(enabled=True, n_shared_experts=2, shared_expert_intermediate_dim=3072,
                        n_routed_experts=256, top_k=8, expert_intermediate_dim=768,
                        aux_loss_free=True, bias_update_speed=0.001),
-        dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        dsa=DSAConfig(enabled=False, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        kda_diff=KDADiffConfig(enabled=True, linear_ratio=3, kernel_dim=128, latent_dim=512, use_dynamic_ratio=True),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
-        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
-                                     first_layer_attn=True, last_layers_dense=2),
+        interleave=InterleaveConfig(enabled=True, pattern="cross_layer", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2,
+                                     fusion_layers=[38, 39]),
         generation=GenerationConfig(max_context=131072, max_output_tokens=32768,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -848,10 +984,12 @@ def _make_ultra_371b() -> MamformerConfig:
         moe=MoEConfig(enabled=True, n_shared_experts=2, shared_expert_intermediate_dim=3584,
                        n_routed_experts=384, top_k=8, expert_intermediate_dim=896,
                        aux_loss_free=True, bias_update_speed=0.001),
-        dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        dsa=DSAConfig(enabled=False, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        kda_diff=KDADiffConfig(enabled=True, linear_ratio=3, kernel_dim=128, latent_dim=512, use_dynamic_ratio=True),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
-        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
-                                     first_layer_attn=True, last_layers_dense=2),
+        interleave=InterleaveConfig(enabled=True, pattern="cross_layer", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2,
+                                     fusion_layers=[44, 45]),
         generation=GenerationConfig(max_context=262144, max_output_tokens=65536,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -871,10 +1009,12 @@ def _make_ultra_671b() -> MamformerConfig:
         moe=MoEConfig(enabled=True, n_shared_experts=2, shared_expert_intermediate_dim=3584,
                        n_routed_experts=640, top_k=8, expert_intermediate_dim=896,
                        aux_loss_free=True, bias_update_speed=0.001),
-        dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        dsa=DSAConfig(enabled=False, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
+        kda_diff=KDADiffConfig(enabled=True, linear_ratio=3, kernel_dim=128, latent_dim=512, use_dynamic_ratio=True),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
-        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
-                                     first_layer_attn=True, last_layers_dense=2),
+        interleave=InterleaveConfig(enabled=True, pattern="cross_layer", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2,
+                                     fusion_layers=[48, 49, 50, 51]),
         generation=GenerationConfig(max_context=1048576, max_output_tokens=163800,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )

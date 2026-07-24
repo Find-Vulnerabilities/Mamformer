@@ -67,15 +67,21 @@ class MamformerTokenizer:
 
     def _encode_simple(self, text: str, **kwargs) -> List[int]:
         """Simple character-level encoding (fallback)."""
-        # Map each character to its ASCII/Unicode code point (mod vocab_size)
         ids = []
+        oov_warned = False
         for ch in text:
             code = ord(ch)
-            if code < self.vocab_size:
+            if code < self.vocab_size and code > 0:
                 ids.append(code)
             else:
-                # Fallback: use space (32)
-                ids.append(32)
+                if not oov_warned:
+                    import warnings
+                    warnings.warn(
+                        f"Character '{ch}' (U+{code:04X}) exceeds vocab_size={self.vocab_size}. "
+                        "Non-ASCII content will be mapped to space. Use a real tokenizer for production."
+                    )
+                    oov_warned = True
+                ids.append(32)  # space fallback
         return ids
 
     def _decode_simple(self, ids: List[int], **kwargs) -> str:

@@ -50,15 +50,23 @@ class MamformerModel(nn.Module):
             config.vocab_size, config.d_model
         )
 
-        # Resolve attention layers for interleaving
+        # Resolve layer types for interleaving
         if config.interleave.enabled:
-            attention_layers = set(config.interleave.resolve_attention_layers(config.n_layers))
+            layer_types = config.interleave.resolve_layer_types(config.n_layers)
         else:
-            attention_layers = set(range(config.n_layers))  # All layers hybrid
+            # All layers are fusion (has_attention=True, has_ssm=True)
+            layer_types = [
+                {"has_attention": True, "has_ssm": True, "is_fusion": True}
+                for _ in range(config.n_layers)
+            ]
 
-        # Stack of hybrid Mamformer blocks (attention layers) + SSM-only blocks
-        self.layers = nn.ModuleList([
-            MamformerBlock(
+        # Stack of Mamformer blocks with mode-specific configuration.
+        # Track attention-layer index separately for KDA-Diff's fixed interleaving.
+        attn_layer_counter = 0
+        self.layers = nn.ModuleList()
+        for i, lt in enumerate(layer_types):
+            is_attn = lt["has_attention"]
+            layer = MamformerBlock(
                 d_model=config.d_model,
                 n_heads=config.n_heads,
                 n_kv_heads=config.n_kv_heads,
@@ -72,8 +80,9 @@ class MamformerModel(nn.Module):
                 dropout=config.dropout,
                 rms_norm_eps=config.rms_norm_eps,
                 sliding_window=config.sliding_window if config.use_sliding_window else 0,
-                # Attention control
-                has_attention=(i in attention_layers),
+                # Mode control
+                has_attention=lt["has_attention"],
+                has_ssm=lt["has_ssm"],
                 layer_idx=i,
                 # DSA options
                 use_dsa=config.dsa.enabled and not config.kda_diff.enabled,
@@ -111,8 +120,12 @@ class MamformerModel(nn.Module):
                 comm_moe_depth=config.communicative_moe.comm_depth,
                 comm_moe_dropout=config.communicative_moe.comm_dropout,
             )
-            for i in range(config.n_layers)
-        ])
+            self.layers.append(layer)
+            # Set KDA-Diff attention-layer index for correct fixed interleaving
+            if is_attn and config.kda_diff.enabled:
+                if hasattr(layer, 'attention') and hasattr(layer.attention, 'set_layer_idx'):
+                    layer.attention.set_layer_idx(i, attn_layer_counter)
+                attn_layer_counter += 1
 
         # Final normalization
         self.norm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
@@ -175,27 +188,40 @@ class MamformerModel(nn.Module):
         per_layer_cache = cache if cache is not None else [None] * len(self.layers)
         moe_aux_info_list: List[dict] = []
 
+        # Cross-layer SSM state tracking
+        # When an SSM-only layer produces h_states, we hold them here
+        # and inject them into the next attention-only layer.
+        pending_ssm_h: Optional[torch.Tensor] = None
+
         # Stack through layers
         for idx, layer in enumerate(self.layers):
             layer_cache = per_layer_cache[idx] if idx < len(per_layer_cache) else None
 
+            # Prepare cross-layer SSM state for attention-only layers
+            layer_kwargs: dict = {}
+            if layer.has_attention and not layer.has_ssm and pending_ssm_h is not None:
+                layer_kwargs["ssm_h_states"] = pending_ssm_h
+
             if self.gradient_checkpointing and self.training:
-                # Use activation checkpointing to save memory
-                # NOTE: gradient checkpointing is incompatible with KV caching.
-                # During training, caching is not needed, so we disable it.
-                def make_custom_forward(layer):
+                # NOTE: Gradient checkpointing blocks cross-layer SSM state
+                # propagation. SSM layers inside checkpointed regions cannot
+                # export h_states. This is an inherent memory-quality tradeoff.
+                # For best results with cross_layer mode, disable checkpointing
+                # or checkpoint only attention layers.
+                def make_custom_forward(layer, kwargs):
                     def custom_forward(hidden_states, attention_mask):
                         outputs = layer(
                             hidden_states,
                             attention_mask=attention_mask,
                             use_cache=False,
                             cache=None,
+                            **kwargs,
                         )
                         return outputs[0]  # Return only hidden_states
                     return custom_forward
 
                 hidden_states = activation_checkpoint(
-                    make_custom_forward(layer),
+                    make_custom_forward(layer, layer_kwargs),
                     hidden_states,
                     attention_mask,
                     use_reentrant=False,
@@ -207,7 +233,20 @@ class MamformerModel(nn.Module):
                     attention_mask=attention_mask,
                     use_cache=use_cache,
                     cache=layer_cache,
+                    **layer_kwargs,
                 )
+
+            # Update cross-layer SSM state from SSM-only layers.
+            # Works during both training (use_cache=False) and inference —
+            # SSM layers always return h_states in their cache dict.
+            if not layer.has_attention and layer.has_ssm:
+                if new_cache_entry is not None and "ssm_h_states" in new_cache_entry:
+                    pending_ssm_h = new_cache_entry["ssm_h_states"]
+
+            # Clear SSM state after it's been consumed by an attention-only
+            # layer to prevent stale state reuse across consecutive attention layers.
+            if layer.has_attention and not layer.has_ssm and layer_kwargs.get("ssm_h_states") is not None:
+                pending_ssm_h = None
 
             if use_cache:
                 new_caches.append(new_cache_entry)
@@ -252,12 +291,13 @@ class MamformerModel(nn.Module):
         attn_params = sum(
             p.numel()
             for layer in self.layers
-            if layer.has_attention
+            if layer.has_attention and layer.attention is not None
             for name, p in layer.attention.named_parameters()
         )
         ssm_params = sum(
             p.numel()
             for layer in self.layers
+            if layer.has_ssm and layer.ssm is not None
             for name, p in layer.ssm.named_parameters()
         )
         ffn_params = sum(
@@ -266,19 +306,26 @@ class MamformerModel(nn.Module):
             for name, p in layer.ffn.named_parameters()
         )
 
-        n_hybrid = sum(1 for layer in self.layers if layer.has_attention)
-        n_ssm_only = sum(1 for layer in self.layers if not layer.has_attention)
+        n_fusion = sum(1 for layer in self.layers if getattr(layer, 'is_fusion', layer.has_attention and layer.has_ssm))
+        n_attn_only = sum(1 for layer in self.layers if layer.has_attention and not layer.has_ssm)
+        n_ssm_only = sum(1 for layer in self.layers if not layer.has_attention and layer.has_ssm)
 
         sep = "=" * 55
         print(sep)
         print("  Mamformer Model Parameter Summary")
         print(sep)
         print(f"  Embedding:     {embedding_params:>15,}")
+        layer_desc_parts = []
+        if n_fusion > 0:
+            layer_desc_parts.append(f"{n_fusion} fusion")
+        if n_attn_only > 0:
+            layer_desc_parts.append(f"{n_attn_only} attn-only")
         if n_ssm_only > 0:
-            print(f"  Layers: {n_hybrid} hybrid + {n_ssm_only} SSM-only (x{len(self.layers)} total)")
+            layer_desc_parts.append(f"{n_ssm_only} SSM-only")
+        print(f"  Layers: {', '.join(layer_desc_parts)} (x{len(self.layers)} total)")
         print(f"  Per-layer:")
-        print(f"    Attention:   {attn_params // max(1, n_hybrid):>15,}")
-        print(f"    SSM:         {ssm_params // len(self.layers):>15,}")
+        print(f"    Attention:   {attn_params // max(1, n_fusion + n_attn_only):>15,}")
+        print(f"    SSM:         {ssm_params // max(1, n_fusion + n_ssm_only):>15,}")
         print(f"    FFN:         {ffn_params // len(self.layers):>15,}")
         print(f"    Total/layer: {layer_params // len(self.layers):>15,}")
         print(f"  Layers (x{len(self.layers)}):  {layer_params:>15,}")

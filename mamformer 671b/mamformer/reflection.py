@@ -231,11 +231,11 @@ class ReflectionModule(nn.Module):
                 reduction='none',
             )
             # Did refinement help? (1 if yes, 0 if no)
-            # Per-token improvement, then aggregate to per-sample
-            improved = (refined_loss_per_token < original_loss).float()
-            # Reshape to (batch, seqlen) then mean over tokens -> (batch,)
-            bs = refined_logits.shape[0]
-            improved_per_sample = improved.view(bs, -1).mean(dim=1)
+            # Mask ignored positions (-100) to avoid biasing the improvement rate
+            valid_mask = (shift_labels.view(-1) != -100).float()
+            improved = (refined_loss_per_token < original_loss).float() * valid_mask
+            valid_count = valid_mask.view(bs, -1).sum(dim=1).clamp(min=1)
+            improved_per_sample = improved.view(bs, -1).sum(dim=1) / valid_count
 
         # Confidence loss: push confidence toward actual per-sample improvement
         conf_loss = F.mse_loss(confidence.squeeze(-1), improved_per_sample)

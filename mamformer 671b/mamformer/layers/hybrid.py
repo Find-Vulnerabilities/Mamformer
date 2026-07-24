@@ -50,19 +50,23 @@ class MamformerBlock(nn.Module):
     """
     A single hybrid block combining Attention and Mamba-2 SSM.
 
-    Supports:
-      - GQA or DSA for the attention pathway
-      - SwiGLU FFN or DeepSeekMoE for the feed-forward pathway
+    Supports three operation modes:
 
-    The two pathways (attention and SSM) process the same normalized
-    input in parallel. Their outputs are fused via a learnable
-    per-dimension sigmoid gate:
+    1. Fusion (has_attention=True, has_ssm=True):
+       Attention and SSM run in PARALLEL, fused via learnable gate:
+           out = σ(α) ⊙ attn(x) + (1 - σ(α)) ⊙ ssm(x)
+       DSA/KDA-Diff receive SSM state from the same layer's SSM output.
 
-        out = σ(α) ⊙ attn(x) + (1 - σ(α)) ⊙ ssm(x)
+    2. Attention-only (has_attention=True, has_ssm=False):
+       Cross-layer mode: attention receives SSM state from a PREVIOUS
+       SSM-only layer via the ssm_h_states parameter.
 
-    where α is a learnable parameter of shape (d_model,).
+    3. SSM-only (has_attention=False, has_ssm=True):
+       SSM only, returns h_states for the next attention layer.
+       No attention, no gate — saves ~50% FLOPs.
 
-    After fusion, a FFN (dense SwiGLU or MoE) with residual completes the block.
+    After the primary pathway(s), a FFN (dense SwiGLU or MoE) with
+    residual completes the block.
 
     Args:
         d_model: Hidden dimension
@@ -78,6 +82,10 @@ class MamformerBlock(nn.Module):
         dropout: Dropout rate
         rms_norm_eps: Epsilon for RMSNorm
         sliding_window: Sliding window attention size (0 = disabled)
+
+        # Mode control
+        has_attention: Enable attention pathway
+        has_ssm: Enable SSM pathway (default True)
 
         # DSA options
         use_dsa: Use Differential State-Aware Attention instead of GQA
@@ -110,8 +118,9 @@ class MamformerBlock(nn.Module):
         dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
         sliding_window: int = 0,
-        # Attention control
+        # Mode control
         has_attention: bool = True,
+        has_ssm: bool = True,
         layer_idx: int = 0,
         # DSA
         use_dsa: bool = False,
@@ -160,12 +169,23 @@ class MamformerBlock(nn.Module):
         self.d_model = d_model
         self.sliding_window = sliding_window
         self.has_attention = has_attention
+        self.has_ssm = has_ssm
+        self.is_fusion = has_attention and has_ssm
         self.layer_idx = layer_idx
         self.use_dsa = use_dsa and has_attention
         self.use_kda_diff = use_kda_diff and has_attention
         self.use_moe = use_moe
         self.use_st_moe = use_st_moe
         self.use_dynamic_gate = use_dynamic_gate and has_attention
+        self.use_deepnorm = use_deepnorm
+
+        # DeepNorm for stabilized residual scaling in deep networks
+        if use_deepnorm:
+            # DeepNet formula: α = (2N)^(-1/4) for N layers
+            alpha_val = (2.0 * deepnorm_n_layers) ** (-0.25)
+            self.register_buffer("deepnorm_alpha", torch.tensor(alpha_val))
+        else:
+            self.deepnorm_alpha = None
 
         # Common RoPE config for attention modules
         rope_kwargs = dict(
@@ -225,18 +245,21 @@ class MamformerBlock(nn.Module):
         else:
             self.attention = None
 
-        # SSM pathway
-        self.ssm = Mamba2Block(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=mamba_expand,
-        )
+        # SSM pathway (only if has_ssm=True)
+        if has_ssm:
+            self.ssm = Mamba2Block(
+                d_model=d_model,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=mamba_expand,
+            )
+        else:
+            self.ssm = None
 
-        # Learnable per-dimension gate (only for hybrid layers)
+        # Learnable per-dimension gate (only for fusion layers)
         # Initialized to 0 → sigmoid(0) = 0.5 → equal weight to both pathways
         # When use_dynamic_gate=True, replaced by a context-dependent MLP gate
-        if has_attention:
+        if self.is_fusion:
             if use_dynamic_gate:
                 self.gate_alpha = None
                 self.dynamic_gate = DynamicGate(d_model=d_model, bottleneck=dynamic_gate_bottleneck)
@@ -310,96 +333,176 @@ class MamformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         cache: Optional[dict] = None,
+        ssm_h_states: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[dict]]:
         """
         Forward pass for a single Mamformer block.
 
-        Hybrid layers (has_attention=True):
-            Input → Norm → [Attention ∥ SSM] → Gate → +residual → Norm → FFN → +residual
+        Three modes:
 
-        SSM-only layers (has_attention=False):
+        Fusion (has_attention=True, has_ssm=True):
+            Input → Norm → [Attention ∥ SSM] → Gate → +residual → Norm → FFN → +residual
+            DSA/KDA-Diff receives SSM state from same layer's SSM output.
+
+        Attention-only (has_attention=True, has_ssm=False):
+            Input → Norm → Attention (with cross-layer SSM injection) → +residual → Norm → FFN → +residual
+            No SSM, no gate. Receives ssm_h_states from a previous SSM-only layer.
+
+        SSM-only (has_attention=False, has_ssm=True):
             Input → Norm → SSM → +residual → Norm → FFN → +residual
-            (No attention, no gate — saves ~40-50% FLOPs)
+            Returns ssm_h_states for the next attention layer.
 
         Args:
             hidden_states: (batch, seqlen, d_model)
             attention_mask: Optional attention mask
             use_cache: If True, return updated cache for autoregressive generation
             cache: Optional cache dict from previous step
+            ssm_h_states: Cross-layer SSM state from previous SSM-only layer.
+                         Only used in attention-only mode.
+                         Shape: (batch, seqlen, d_state)
 
         Returns:
             (output, cache) — output shape (batch, seqlen, d_model)
-            cache dict includes optional 'moe_aux_info' for logging
+            cache dict includes:
+              - "attn": attention KV cache (if has_attention)
+              - "ssm": SSM state cache (if has_ssm)
+              - "ssm_h_states": SSM per-timestep states for cross-layer injection (if SSM-only)
+              - "moe_aux_info": MoE routing statistics (if MoE enabled)
         """
         # First residual
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
 
-        ssm_cache = cache.get("ssm") if cache is not None else None
+        # ── SSM pathway (if enabled) ───────────────────────────
+        ssm_out = None
+        ssm_new_cache = None
+        ssm_local_h_states = None
 
-        # SSM runs first so downstream consumers (DSA/ST-MoE)
-        # can access its state for cross-pollination
-        ssm_h_states = None
-        need_h_states = self.use_st_moe or self.use_dsa or self.use_kda_diff
-        if need_h_states:
-            ssm_result = self.ssm(
-                hidden_states,
-                use_cache=use_cache,
-                cache=ssm_cache,
-                return_h_states=True,
-            )
-            ssm_out, ssm_new_cache, ssm_h_states = ssm_result
-        else:
-            ssm_out, ssm_new_cache = self.ssm(
-                hidden_states,
-                use_cache=use_cache,
-                cache=ssm_cache,
-            )
+        if self.has_ssm and self.ssm is not None:
+            ssm_cache = cache.get("ssm") if cache is not None else None
 
-        # ── SSM-only path: no attention, no gate ──────────────────
+            # Determine if we need h_states (for fusion's DSA injection or cross-layer pass-through)
+            need_h_states = (
+                (self.is_fusion and (self.use_dsa or self.use_kda_diff or self.use_st_moe))
+                or (not self.has_attention)
+            )
+            if need_h_states:
+                ssm_result = self.ssm(
+                    hidden_states,
+                    use_cache=use_cache,
+                    cache=ssm_cache,
+                    return_h_states=True,
+                )
+                ssm_out, ssm_new_cache, ssm_local_h_states = ssm_result
+            else:
+                ssm_out, ssm_new_cache = self.ssm(
+                    hidden_states,
+                    use_cache=use_cache,
+                    cache=ssm_cache,
+                )
+
+        # ── SSM-only path: no attention, no gate ──────────────
         if not self.has_attention:
-            hidden_states = residual + ssm_out
+            if ssm_out is None:
+                raise RuntimeError("SSM-only layer requires has_ssm=True")
+            # Apply DeepNorm residual scaling if enabled
+            if self.deepnorm_alpha is not None:
+                hidden_states = self.deepnorm_alpha * residual + ssm_out
+            else:
+                hidden_states = residual + ssm_out
 
             # FFN (MoE or dense)
-            residual = hidden_states
+            residual2 = hidden_states
             hidden_states = self.post_norm(hidden_states)
 
             moe_aux_info = None
-            if self.use_st_moe:
+            if self.use_st_moe and ssm_local_h_states is not None:
                 ffn_out, moe_aux_info = self.ffn(
-                    hidden_states, ssm_h_states=ssm_h_states
+                    hidden_states, ssm_h_states=ssm_local_h_states
                 )
             elif self.use_moe:
                 ffn_out, moe_aux_info = self.ffn(hidden_states)
             else:
                 ffn_out = self.ffn(hidden_states)
 
-            hidden_states = residual + ffn_out
+            hidden_states = residual2 + ffn_out
 
             new_cache = None
             if use_cache:
                 new_cache = {"ssm": ssm_new_cache}
                 if moe_aux_info is not None:
                     new_cache["moe_aux_info"] = moe_aux_info
+            # Always pass ssm_h_states back — cross-layer injection needs it
+            # during both training (use_cache=False) and inference.
+            if ssm_local_h_states is not None:
+                if new_cache is None:
+                    new_cache = {}
+                new_cache["ssm_h_states"] = ssm_local_h_states
 
             return hidden_states, new_cache
 
-        # ── Hybrid path: attention + SSM with gated fusion ────────
+        # ── Attention pathway ──────────────────────────────────
         attn_cache = cache.get("attn") if cache is not None else None
 
-        # DSA/KDA-Diff receives per-timestep SSM state summaries
-        ssm_kwargs = {}
-        if (self.use_dsa or self.use_kda_diff) and ssm_h_states is not None:
-            ssm_kwargs = {"h_states": ssm_h_states}
+        # Determine SSM state source for DSA/KDA-Diff injection:
+        # - Fusion mode: use same-layer SSM output (ssm_local_h_states)
+        # - Attention-only mode: use cross-layer state from parameter
+        attn_ssm_kwargs = {}
+        if self.is_fusion and ssm_local_h_states is not None:
+            attn_ssm_kwargs = {"h_states": ssm_local_h_states}
+        elif not self.has_ssm and ssm_h_states is not None:
+            # Cross-layer injection from previous SSM-only layer
+            attn_ssm_kwargs = {"h_states": ssm_h_states}
 
         attn_out, attn_new_cache = self.attention(
             hidden_states,
             attention_mask=attention_mask,
             use_cache=use_cache,
             cache=attn_cache,
-            **ssm_kwargs,
+            **attn_ssm_kwargs,
         )
 
+        # ── Attention-only path: no SSM, no gate ──────────────
+        if not self.has_ssm:
+            if self.deepnorm_alpha is not None:
+                hidden_states = self.deepnorm_alpha * residual + attn_out
+            else:
+                hidden_states = residual + attn_out
+
+            # FFN (MoE or dense)
+            # ST-MoE works in attention-only mode too — falls back to spatial routing
+            # when ssm_h_states is not available
+            residual2 = hidden_states
+            hidden_states = self.post_norm(hidden_states)
+
+            moe_aux_info = None
+            # Unified MoE dispatch for attention-only path.
+            # Cross-layer SSM state (ssm_h_states param) is passed to ST-MoE
+            # for temporal routing when available.
+            is_moe = self.use_st_moe or self.use_moe
+            if is_moe:
+                if self.use_st_moe:
+                    # Pass cross-layer SSM state for temporal routing
+                    ffn_out, moe_aux_info = self.ffn(
+                        hidden_states,
+                        ssm_h_states=ssm_h_states if ssm_h_states is not None else None,
+                    )
+                else:
+                    ffn_out, moe_aux_info = self.ffn(hidden_states)
+            else:
+                ffn_out = self.ffn(hidden_states)
+
+            hidden_states = residual2 + ffn_out
+
+            new_cache = None
+            if use_cache:
+                new_cache = {"attn": attn_new_cache}
+                if moe_aux_info is not None:
+                    new_cache["moe_aux_info"] = moe_aux_info
+
+            return hidden_states, new_cache
+
+        # ── Fusion path: attention + SSM with gated fusion ────
         # Learnable gated fusion (static or dynamic)
         if self.dynamic_gate is not None:
             gate = self.dynamic_gate(hidden_states)  # (d_model,)
@@ -407,24 +510,27 @@ class MamformerBlock(nn.Module):
             gate = torch.sigmoid(self.gate_alpha)  # (d_model,)
         combined = gate * attn_out + (1.0 - gate) * ssm_out
 
-        # First residual connection
-        hidden_states = residual + combined
+        # First residual connection (with optional DeepNorm scaling)
+        if self.deepnorm_alpha is not None:
+            hidden_states = self.deepnorm_alpha * residual + combined
+        else:
+            hidden_states = residual + combined
 
         # Second residual block: Norm → FFN (MoE or dense) → Residual
-        residual = hidden_states
+        residual2 = hidden_states
         hidden_states = self.post_norm(hidden_states)
 
         moe_aux_info = None
-        if self.use_st_moe:
+        if self.use_st_moe and ssm_local_h_states is not None:
             ffn_out, moe_aux_info = self.ffn(
-                hidden_states, ssm_h_states=ssm_h_states
+                hidden_states, ssm_h_states=ssm_local_h_states
             )
         elif self.use_moe:
             ffn_out, moe_aux_info = self.ffn(hidden_states)
         else:
             ffn_out = self.ffn(hidden_states)
 
-        hidden_states = residual + ffn_out
+        hidden_states = residual2 + ffn_out
 
         # Build cache
         new_cache = None
@@ -461,33 +567,36 @@ class MamformerBlock(nn.Module):
         return None
 
     def extra_repr(self) -> str:
-        if not self.has_attention:
-            ffn_type = "ST-MoE" if self.use_st_moe else ("MoE" if self.use_moe else "SwiGLU")
-            return (
-                f"d_model={self.d_model}, "
-                f"mode=SSM-only, ffn={ffn_type}, "
-                f"d_state={self.ssm.d_state}, "
-                f"d_conv={self.ssm.d_conv}"
-            )
+        # Determine mode
+        if self.is_fusion:
+            mode = "fusion (parallel)"
+        elif self.has_attention:
+            mode = "attention-only (cross-layer)"
+        else:
+            mode = "SSM-only"
 
-        attn_type = "KDA-Diff" if self.use_kda_diff else ("DSA" if self.use_dsa else "GQA")
+        ffn_type = "SwiGLU"
         if self.use_st_moe:
             ffn_type = "ST-MoE"
         elif self.use_moe:
             ffn_type = "MoE"
-        else:
-            ffn_type = "SwiGLU"
         if hasattr(self, 'ffn') and hasattr(self.ffn, 'comm_layer'):
             ffn_type = f"Communicative{ffn_type}"
-        n_heads = getattr(self.attention, 'n_heads', '?')
-        n_kv_heads = getattr(self.attention, 'n_kv_heads', '?')
-        head_dim = getattr(self.attention, 'head_dim', '?')
-        return (
-            f"d_model={self.d_model}, "
-            f"attn={attn_type}, ffn={ffn_type}, "
-            f"n_heads={n_heads}, "
-            f"n_kv_heads={n_kv_heads}, "
-            f"head_dim={head_dim}, "
-            f"d_state={self.ssm.d_state}, "
-            f"d_conv={self.ssm.d_conv}"
-        )
+
+        parts = [f"d_model={self.d_model}", f"mode={mode}", f"ffn={ffn_type}"]
+
+        if self.has_attention:
+            attn_type = "KDA-Diff" if self.use_kda_diff else ("DSA" if self.use_dsa else "GQA")
+            n_heads = getattr(self.attention, 'n_heads', '?')
+            n_kv_heads = getattr(self.attention, 'n_kv_heads', '?')
+            head_dim = getattr(self.attention, 'head_dim', '?')
+            parts.append(f"attn={attn_type}")
+            parts.append(f"n_heads={n_heads}")
+            parts.append(f"n_kv_heads={n_kv_heads}")
+            parts.append(f"head_dim={head_dim}")
+
+        if self.has_ssm and self.ssm is not None:
+            parts.append(f"d_state={self.ssm.d_state}")
+            parts.append(f"d_conv={self.ssm.d_conv}")
+
+        return ", ".join(parts)

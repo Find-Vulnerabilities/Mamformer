@@ -30,7 +30,7 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Generator
+from typing import List, Optional, Tuple, Generator
 
 import torch
 
@@ -395,8 +395,18 @@ class ChatSession:
             logits = outputs["logits"][:, -1, :]
             cache = outputs.get("cache")
 
-            # Temperature scaling
-            if self.temperature > 0 and self.temperature != 1.0:
+            # Temperature scaling (greedy when temperature=0)
+            if self.temperature <= 0:
+                # Greedy: take argmax directly
+                next_token = logits.argmax(dim=-1, keepdim=True)
+                generated = torch.cat([generated, next_token], dim=-1)
+                token_id = next_token[0, 0].item()
+                yield token_id
+                if config.eos_token_id is not None and token_id == config.eos_token_id:
+                    break
+                continue
+
+            if self.temperature != 1.0:
                 logits = logits / self.temperature
 
             # Top-k

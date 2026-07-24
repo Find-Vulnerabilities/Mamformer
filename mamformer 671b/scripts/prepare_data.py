@@ -143,9 +143,9 @@ def tokenize_and_save(
     # False after the while loop, so this was dead code; write partial chunk
     # as the last chunk if buffer has any tokens)
     if len(buffer) > 0:
-        if len(buffer) >= seq_len + 1:
-            chunk = buffer[: seq_len + 1]
-        else:
+        # After the while loop, len(buffer) < seq_len + 1 is guaranteed.
+        # Only write the remainder if it contains meaningful data.
+        if len(buffer) > 0:
             # Pad the final incomplete chunk with zeros (will be masked by labels)
             chunk = list(buffer) + [0] * (seq_len + 1 - len(buffer))
         arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)

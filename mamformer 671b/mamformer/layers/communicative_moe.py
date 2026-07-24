@@ -267,6 +267,9 @@ class CommunicativeMoE(nn.Module):
             lambda_val = base._get_lambda_tensor()
             temporal_bias = base.temporal_proj(ssm_h_states) * lambda_val
             router_logits = spatial_logits + temporal_bias
+            # Apply ST-MoE balance lock if enabled (preserves safety guarantee)
+            if base.use_balance_lock and self.training:
+                router_logits, _ = base._apply_balance_lock(router_logits, spatial_logits)
         else:
             router_logits = base.router(x)
 

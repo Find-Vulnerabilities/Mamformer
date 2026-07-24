@@ -306,15 +306,20 @@ def _run_single_test(
     if not _is_safe_test_input(test_input):
         return False
 
-    # Build test harness that avoids string interpolation of user input
+    # Validate function_name: only allow valid Python identifiers
+    import re as _re
+    if not _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', function_name):
+        return False
+
+    # Build test harness
     harness_lines = [
         "import sys, json",
         "# User code",
         code,
         "",
         "# Test harness: use json.loads to safely parse input",
-        f"_input = json.loads(sys.argv[1])",
-        f"_expected = json.loads(sys.argv[2])",
+        "_input = json.loads(sys.argv[1])",
+        "_expected = json.loads(sys.argv[2])",
         "try:",
         f"    _result = str({function_name}(*_input)) if isinstance(_input, list) else str({function_name}(_input))",
         "    if _result.strip() == str(_expected).strip():",

@@ -65,6 +65,8 @@ class SwiGLUFFN(nn.Module):
         std = 0.02
         for proj in [self.gate_proj, self.up_proj, self.down_proj]:
             nn.init.normal_(proj.weight, mean=0.0, std=std)
+            if proj.bias is not None:
+                nn.init.zeros_(proj.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

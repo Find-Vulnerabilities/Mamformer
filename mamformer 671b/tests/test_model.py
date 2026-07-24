@@ -179,9 +179,9 @@ class TestMamformerForCausalLM:
         """Parameter count should match config estimate approximately."""
         actual = model.num_parameters()
         estimated = model.config.num_parameters
-        # Should be within ~1% (embedding layer specifics may differ slightly)
-        diff_pct = abs(actual - estimated) / estimated * 100
-        assert diff_pct < 20, f"Parameter count mismatch: actual={actual:,} vs estimated={estimated:,} ({diff_pct:.1f}%)"
+        # Should be within ~5% (embedding layer specifics may differ slightly)
+        diff_pct = abs(actual - estimated) / max(estimated, 1) * 100
+        assert diff_pct < 5, f"Parameter count mismatch: actual={actual:,} vs estimated={estimated:,} ({diff_pct:.1f}%)"
 
 
 class TestGradientCheckpointing:

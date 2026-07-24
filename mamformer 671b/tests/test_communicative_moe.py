@@ -538,7 +538,7 @@ class TestCommunicativeMoEConfig:
         config.communicative_moe.enabled = True
 
         with pytest.raises(ValueError, match="CommunicativeMoE requires MoE"):
-            config.__post_init__()
+            MamformerConfig(**{k: v for k, v in config.__dict__.items() if not k.startswith('_')})  # trigger validation
 
     def test_summary_includes_comm_moe(self):
         """Summary should mention CommunicativeMoE when enabled."""

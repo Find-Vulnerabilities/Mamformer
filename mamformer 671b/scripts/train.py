@@ -113,9 +113,10 @@ class TextDataset(IterableDataset):
                     "input_ids": chunk[:-1].clone(),
                     "labels": chunk[1:].clone(),
                 }
-            # Carry-over: last partial chunk goes into the small buffer
+            # Carry-over: only keep up to seq_len tokens to bound memory
             if pos < n:
-                buffer.extend(data[pos:].tolist())
+                remainder = data[pos:].tolist()
+                buffer.extend(remainder[-self.seq_len:])  # Keep at most seq_len tokens
             del data, raw_bytes
 
 
@@ -144,7 +145,7 @@ def create_lr_scheduler(
     cosine = CosineAnnealingLR(
         optimizer,
         T_max=max_steps - warmup_steps,
-        eta_min=config["learning_rate"] * min_lr_ratio,
+        eta_min=config.get("learning_rate", 3e-4) * min_lr_ratio,
     )
 
     return SequentialLR(
@@ -266,10 +267,18 @@ def train(config: dict) -> None:
         seq_len=config.get("max_seq_len", 8192),
     )
 
+    # IterableDataset duplicates data across workers without worker_init_fn.
+    # Use num_workers=0 for correctness, or set a proper worker_init_fn.
+    n_workers = config.get("num_workers", 0)
+    if n_workers > 0:
+        logger.warning(
+            f"IterableDataset with num_workers={n_workers} may duplicate data. "
+            "Set num_workers=0 for correct streaming, or implement worker_init_fn."
+        )
     dataloader = DataLoader(
         dataset,
         batch_size=config.get("batch_size", 1),
-        num_workers=config.get("num_workers", 4),
+        num_workers=n_workers,
         pin_memory=True,
     )
 
@@ -296,9 +305,16 @@ def train(config: dict) -> None:
     elif resume_path:
         logger.warning(f"Resume checkpoint not found: {resume_path}, starting from scratch")
 
-    # Mixed precision
-    amp_enabled = config.get("bf16", False) or config.get("fp16", False)
-    amp_dtype = torch.bfloat16 if config.get("bf16", False) else torch.float16 if config.get("fp16", False) else torch.float32
+    # Mixed precision — default to float32 unless explicitly requested
+    use_bf16 = config.get("bf16", False)
+    use_fp16 = config.get("fp16", False)
+    amp_enabled = use_bf16 or use_fp16
+    if use_bf16:
+        amp_dtype = torch.bfloat16
+    elif use_fp16:
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
 
     # ── WandB ──────────────────────────────────────────────────
     use_wandb = config.get("use_wandb", False)
@@ -382,13 +398,14 @@ def train(config: dict) -> None:
 
         loss.backward()
 
-        # ── NaN Gradient Detection ──────────────────────────────
+        # ── NaN Gradient Detection (periodic — expensive on large models) ──
         has_nan_grad = False
-        for name, param in model.named_parameters():
-            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                logger.error(f"NaN/Inf gradient in {name} at step {global_step}")
-                has_nan_grad = True
-                break
+        if global_step % log_every == 0:
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    logger.error(f"NaN/Inf gradient in {name} at step {global_step}")
+                    has_nan_grad = True
+                    break
         if has_nan_grad:
             logger.warning("Zeroing gradients and skipping optimizer step")
             optimizer.zero_grad()

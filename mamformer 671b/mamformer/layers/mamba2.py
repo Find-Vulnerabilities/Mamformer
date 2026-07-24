@@ -67,7 +67,9 @@ def selective_scan(
 
     # Compute A_disc for all timesteps: exp(-exp(A) * dt)
     # Shape: (batch, seqlen, d_inner, d_state)
-    A_param = torch.exp(A)  # (d_state,) — exp(A_log), always positive
+    # Clamp A to prevent overflow: exp(exp(5)) ≈ exp(148) ≈ 2e64 (safe for fp32)
+    A_clamped = torch.clamp(A, min=-5.0, max=5.0)
+    A_param = torch.exp(A_clamped)  # (d_state,) — bounded positive
     dt_expanded = dt.unsqueeze(-1)  # (batch, seqlen, d_inner, 1)
     A_disc = torch.exp(-A_param.view(1, 1, 1, d_state) * dt_expanded)
     # A_disc is in (0, 1], numerically stable since A_param >= 0
@@ -282,29 +284,71 @@ class Mamba2Block(nn.Module):
         xz = self.in_proj(u)  # (batch, seqlen, 2 * d_inner)
         x, z = xz.chunk(2, dim=-1)  # each (batch, seqlen, d_inner)
 
+        # Save raw x BEFORE convolution for correct conv_state caching
+        raw_x = x
+
         # Causal 1D convolution
         x = self._causal_conv1d(x, cache=cache if use_cache else None)
 
         # SiLU activation
         x_act = F.silu(x)
 
-        # Project dt, B, C
-        dt = F.softplus(self.dt_proj(x_act))  # (batch, seqlen, d_inner), positive
-        B = self.B_proj(x_act)  # (batch, seqlen, d_state)
-        C = self.C_proj(x_act)  # (batch, seqlen, d_state)
-
-        # Selective scan (SSD kernel) with proper state caching
+        # Selective scan (SSD kernel) with proper state caching.
+        # Uses Triton fused kernel when available for full-sequence (training) path.
         h_states = None
         final_h_state = None
-        if use_cache and cache is not None and cache.get("ssm_state") is not None:
-            # ── Incremental step: use recurrent formulation with previous state ──
+        incremental = use_cache and cache is not None and cache.get("ssm_state") is not None
+
+        if incremental:
+            # ── Incremental step: project + recurrent update ──
+            dt = F.softplus(self.dt_proj(x_act))
+            B = self.B_proj(x_act)
+            C = self.C_proj(x_act)
             y, final_h_state = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
+
+        elif seqlen > 1 and not return_h_states:
+            # ── Try Triton fused kernel for training (fast path) ──
+            try:
+                from mamformer.kernels.triton_ssd import is_triton_available, triton_selective_scan_fused
+                if is_triton_available():
+                    y = triton_selective_scan_fused(
+                        x_act, self.dt_proj, self.A_log,
+                        self.B_proj, self.C_proj, self.D,
+                    )
+                    if use_cache:
+                        # Fused kernel doesn't return final state — compute from last position
+                        dt_last = F.softplus(self.dt_proj(x_act[:, -1:]))
+                        B_last = self.B_proj(x_act[:, -1:])
+                        x_last = x_act[:, -1:]
+                        A_clamped = torch.clamp(self.A_log, min=-5.0, max=5.0)
+                        A_param = torch.exp(A_clamped)
+                        A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
+                        B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
+                        final_h_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]
+                else:
+                    raise ImportError
+            except (ImportError, Exception):
+                # Fallback to staged path
+                dt = F.softplus(self.dt_proj(x_act))
+                B = self.B_proj(x_act)
+                C = self.C_proj(x_act)
+                scan_result = selective_scan(
+                    x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
+                    return_h_states=False, return_final_state=use_cache,
+                )
+                if use_cache:
+                    y, final_h_state = scan_result
+                else:
+                    y = scan_result
         else:
-            # ── Full sequence scan ──
+            # ── Staged path (return_h_states or seqlen==1) ──
+            dt = F.softplus(self.dt_proj(x_act))
+            B = self.B_proj(x_act)
+            C = self.C_proj(x_act)
             scan_result = selective_scan(
                 x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
                 return_h_states=return_h_states,
-                return_final_state=use_cache,  # Need final state for cache
+                return_final_state=use_cache,
             )
             if return_h_states and use_cache:
                 y, h_states, final_h_state = scan_result
@@ -325,20 +369,16 @@ class Mamba2Block(nn.Module):
         # Build cache with correct SSM state preservation
         new_cache = None
         if use_cache:
-            # Use the correctly-computed final h state (from recurrent_step or scan)
-            if final_h_state is None:
-                # Fallback: compute from last position
-                dt_last = dt[:, -1:]
-                B_last = B[:, -1:]
-                x_last = x_act[:, -1:]
-                A_param = torch.exp(self.A_log)
-                A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
-                B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
-                final_h_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]
+            # Use the correctly-computed final h state (from recurrent_step or scan).
+            # The scan path always returns final_h_state when return_final_state=True.
+            assert final_h_state is not None, (
+                "selective_scan did not return final_h_state despite return_final_state=True. "
+                "This indicates a bug in the scan function."
+            )
             new_ssm_state = final_h_state
 
-            # Compute conv state (last d_conv-1 positions of x before activation)
-            conv_x = x[:, -(self.d_conv - 1):] if x.shape[1] >= self.d_conv else x
+            # Compute conv state (last d_conv-1 positions of RAW x before convolution)
+            conv_x = raw_x[:, -(self.d_conv - 1):] if raw_x.shape[1] >= self.d_conv else raw_x
             if cache is not None and "conv_state" in cache:
                 conv_x = torch.cat([cache["conv_state"], conv_x], dim=1)[:, -(self.d_conv - 1):]
             new_conv_state = conv_x

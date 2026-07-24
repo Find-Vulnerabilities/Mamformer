@@ -507,7 +507,7 @@ def train_grpo(config: dict) -> None:
                         kwargs["reward_weights"] = rw
 
                     rewards[b_idx, g_idx] = reward_calc.compute(resp, reward_type=rtype, **kwargs)
-                except Exception as e:
+                except (ValueError, KeyError, TypeError) as e:
                     logger.warning(f"Reward computation failed for prompt {b_idx}, gen {g_idx}: {e}")
                     rewards[b_idx, g_idx] = 0.0
 

@@ -477,31 +477,33 @@ class EPMoE(nn.Module):
             if dispatched_x.shape[0] == 0:
                 continue
 
-            # Process dispatched tokens with local experts
+            # Process dispatched tokens with local experts.
+            # IMPORTANT: Tokens were dispatched to this GPU because they were
+            # assigned experts in [expert_start, expert_start + n_local_experts).
+            # We use the ORIGINAL expert assignment (from the router that ran before
+            # dispatch), NOT a re-routing — re-routing would break the dispatch guarantee.
             dispatched_output = torch.zeros_like(dispatched_x)
 
-            # Recompute router logits to determine which local expert each token needs
-            if self.aux_loss_free and self.training:
-                dispatched_gating = F.linear(dispatched_x, self.router.weight) + self.expert_bias
-            else:
-                dispatched_gating = F.linear(dispatched_x, self.router.weight)
-            _, dispatched_exp_idx = torch.topk(dispatched_gating, k=1, dim=-1)
-            dispatched_exp_idx = dispatched_exp_idx.squeeze(-1)
+            # Map dispatched tokens to their originally-assigned local expert
+            # Each dispatched token's expert_idx_k is its ORIGINAL assignment.
+            # Map: global_expert_idx → local_expert_idx
+            dispatched_exp_slot = expert_idx_k[sort_order][:dispatched_x.shape[0]]
 
             for local_idx in range(self.n_local_experts):
                 global_expert_idx = self.expert_start + local_idx
                 expert = self.routed_experts[local_idx]
 
-                expert_mask = (dispatched_exp_idx == global_expert_idx)
+                # Tokens whose ORIGINAL assignment is this expert
+                expert_mask = (dispatched_exp_slot == global_expert_idx)
                 if not expert_mask.any():
                     continue
 
                 expert_input = dispatched_x[expert_mask]
                 expert_output = expert(expert_input)
 
-                # Gate: softmax probability for this expert
-                probs = F.softmax(dispatched_gating[expert_mask], dim=-1)
-                expert_gates = probs[:, global_expert_idx]
+                # Use the original gate value for this expert (from pre-dispatch router)
+                dispatched_gates = gates_k[sort_order][:dispatched_x.shape[0]]
+                expert_gates = dispatched_gates[expert_mask]
 
                 dispatched_output[expert_mask] += expert_output * expert_gates.unsqueeze(-1)
 

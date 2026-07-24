@@ -351,46 +351,13 @@ class SpaceTimeMoE(DeepSeekMoE):
     def get_load_statistics(self) -> dict:
         """
         Get expert load balancing statistics for monitoring.
-
-        Returns:
-            dict with per-expert load, entropy, max load ratio, and ST-MoE info
+        Extends base class stats with ST-MoE-specific info.
         """
-        if self._total_tokens == 0:
-            return {
-                "per_expert_load": None,
-                "load_entropy": 0.0,
-                "lambda": self.lambda_value,
-            }
-
-        counts = self._expert_counts.float()
-        total_assignments = counts.sum()
-        if total_assignments == 0:
-            return {
-                "per_expert_load": None,
-                "load_entropy": 0.0,
-                "lambda": self.lambda_value,
-            }
-
-        per_expert_load = counts / total_assignments
-        load_entropy = 0.0
-        for p in per_expert_load:
-            if p > 0:
-                load_entropy -= p * math.log(p)
-        max_entropy = math.log(self.n_routed_experts)
-        normalized_entropy = load_entropy / max_entropy if max_entropy > 0 else 0.0
-
-        max_load = per_expert_load.max().item()
-        avg_load = 1.0 / self.n_routed_experts
-
-        return {
-            "per_expert_load": per_expert_load.tolist(),
-            "load_entropy": normalized_entropy,
-            "max_load_ratio": max_load / avg_load if avg_load > 0 else 0.0,
-            "bias_values": self.expert_bias.tolist() if self.aux_loss_free else None,
-            "lambda": self.lambda_value,
-            "consecutive_max": self._consecutive_count.max().item() if self.use_balance_lock else 0,
-            "locks_triggered": self._lock_trigger_count.item() if self.use_balance_lock else 0,
-        }
+        stats = super().get_load_statistics()
+        stats["lambda"] = self.lambda_value
+        stats["consecutive_max"] = self._consecutive_count.max().item() if self.use_balance_lock else 0
+        stats["locks_triggered"] = self._lock_trigger_count.item() if self.use_balance_lock else 0
+        return stats
 
     def reset_load_statistics(self) -> None:
         """Reset per-expert token counters (call at start of eval)."""

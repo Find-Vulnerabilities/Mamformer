@@ -345,10 +345,12 @@ class GenerationMixin:
             # Select top num_beams AND reorder caches
             beam_scores = beam_scores.view(batch_size, -1)
             _, best_indices = torch.topk(beam_scores, num_beams, dim=-1)
-            beam_scores = beam_scores.view(-1)[best_indices.view(-1)]
-            best_indices = best_indices.view(-1)
-            generated = generated[best_indices]
-            cache = self._reorder_cache(cache, best_indices)
+            # Add batch offsets to convert from per-batch column indices to global row indices
+            batch_offsets = torch.arange(batch_size, device=device).unsqueeze(1) * (2 * num_beams)
+            best_indices_global = (best_indices + batch_offsets).view(-1)
+            beam_scores = beam_scores.view(-1)[best_indices_global]
+            generated = generated[best_indices_global]
+            cache = self._reorder_cache(cache, best_indices_global)
 
             # End if all beams hit EOS
             if config.eos_token_id is not None:
@@ -428,6 +430,12 @@ class GenerationMixin:
 
             logits = outputs["logits"][:, -1, :]
             cache = outputs.get("cache")
+
+            # Apply repetition penalty (mirrors _sample_loop behavior)
+            if config.repetition_penalty != 1.0:
+                logits = self._apply_repetition_penalty(
+                    logits, generated, config.repetition_penalty
+                )
 
             next_token = self._sample_token(logits, config)
             generated = torch.cat([generated, next_token], dim=-1)

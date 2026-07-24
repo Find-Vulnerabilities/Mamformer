@@ -283,12 +283,12 @@ class DifferentialStateAttention(nn.Module):
         attn_logits_2 = torch.matmul(q2, k.transpose(-2, -1)) * scale
 
         # Apply causal mask (DSA does manual softmax, must apply mask explicitly)
+        kv_len = k.shape[2]
+        q_len = q1.shape[2]
         if attention_mask is not None:
             attn_logits_1 = attn_logits_1 + attention_mask
             attn_logits_2 = attn_logits_2 + attention_mask
         else:
-            kv_len = k.shape[2]
-            q_len = q1.shape[2]
             causal_mask = torch.triu(
                 torch.full((q_len, kv_len), torch.finfo(attn_logits_1.dtype).min,
                           device=x.device, dtype=attn_logits_1.dtype),
@@ -296,6 +296,12 @@ class DifferentialStateAttention(nn.Module):
             ).unsqueeze(0).unsqueeze(0)
             attn_logits_1 = attn_logits_1 + causal_mask
             attn_logits_2 = attn_logits_2 + causal_mask
+
+        # Apply sliding window mask (on top of causal)
+        if self.sliding_window > 0:
+            sw_mask = self._build_sliding_window_mask(q_len, kv_len, x.device, attn_logits_1.dtype)
+            attn_logits_1 = attn_logits_1 + sw_mask
+            attn_logits_2 = attn_logits_2 + sw_mask
 
         # Compute lambda (per head), clamped for stability
         lam_raw = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
@@ -345,6 +351,29 @@ class DifferentialStateAttention(nn.Module):
             flat = flat[:, :target_dim]
         # Project to K/V space
         return proj(flat).view(batch, seqlen, -1)
+
+    def _build_sliding_window_mask(
+        self, q_len: int, kv_len: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """
+        Build sliding window additive mask for DSA attention.
+
+        Position i can attend to keys in [max(0, i+offset-W+1), i+offset]
+        where offset = kv_len - q_len (cache offset).
+        Shape: (1, 1, q_len, kv_len), additive (0=attend, -inf=mask)
+        """
+        offset = kv_len - q_len
+        indices_q = torch.arange(q_len, device=device).unsqueeze(1)  # (q_len, 1)
+        indices_k = torch.arange(kv_len, device=device).unsqueeze(0)  # (1, kv_len)
+        distances = (indices_k - indices_q)  # (q_len, kv_len), positive = key after query
+
+        # Valid: causal (distance >= 0) AND within sliding window (distance < W)
+        window = self.sliding_window
+        valid = (distances >= 0) & (distances < window)
+
+        mask = torch.zeros(q_len, kv_len, device=device, dtype=dtype)
+        mask = mask.masked_fill(~valid, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def get_lambda_values(self) -> torch.Tensor:
         """

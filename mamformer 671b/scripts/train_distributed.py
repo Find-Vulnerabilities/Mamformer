@@ -246,7 +246,7 @@ def train_distributed(config: dict) -> None:
         labels = batch["labels"].to(device)
 
         monitor.start_compute()
-        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=config.get("bf16", False)):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=config.get("bf16", False)):
             outputs = model(input_ids=input_ids, labels=labels)
             loss = outputs["loss"] / grad_accum
         monitor.end_compute()
@@ -262,7 +262,8 @@ def train_distributed(config: dict) -> None:
                     if hasattr(layer, 'ffn') and hasattr(layer.ffn, '_expert_counts'):
                         expert_counts = layer.ffn._expert_counts.float()
                         monitor.update_expert_load(layer_idx, expert_counts)
-                        layer.ffn.reset_load_statistics()
+                        if hasattr(layer.ffn, 'reset_load_statistics'):
+                            layer.ffn.reset_load_statistics()
 
         if (global_step + 1) % grad_accum == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.get("max_grad_norm", 1.0))

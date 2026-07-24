@@ -25,6 +25,14 @@ model:
     d_conv: 4           # 1D convolution kernel size
     dt_rank: "auto"     # auto = ceil(d_model / 16)
 
+  # Interleaved Attention: 1:3 ratio (8 hybrid / 18 SSM-only for 26 layers)
+  interleave:
+    enabled: true
+    pattern: "attn_every_k"
+    attn_every_k: 4
+    first_layer_attn: true
+    last_layers_dense: 2
+
   # RoPE settings
   rope:
     theta: 1000000.0    # Increased for better long-context extrapolation

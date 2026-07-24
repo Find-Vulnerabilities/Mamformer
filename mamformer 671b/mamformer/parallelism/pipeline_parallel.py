@@ -57,6 +57,7 @@ class PipelineStage(nn.Module):
         final_norm: Optional[nn.Module] = None,
         lm_head_weight: Optional[torch.Tensor] = None,
         vocab_size: int = 128000,
+        d_model: int = 4096,
     ):
         super().__init__()
         self.stage_id = stage_id
@@ -68,6 +69,7 @@ class PipelineStage(nn.Module):
         self.embedding = embedding
         self.final_norm = final_norm
         self.lm_head_weight = lm_head_weight  # For tied embeddings
+        self.d_model = d_model
 
         # For loss computation on last stage
         self.vocab_size = vocab_size
@@ -222,7 +224,7 @@ class PipelineScheduler1F1B:
         mb_size = (batch_size + self.num_microbatches - 1) // self.num_microbatches
 
         mbs_input_ids = list(torch.split(input_ids, mb_size, dim=0))
-        mbs_labels = list(torch.split(labels, mb_size, dim=0)) if labels is not None else [None] * len(mbs_input_ids)
+        mbs_labels = list(torch.split(labels, mb_size, dim=0)) if labels is not None else None
         mbs_mask = list(torch.split(attention_mask, mb_size, dim=0)) if attention_mask is not None else [None] * len(mbs_input_ids)
 
         num_mb = len(mbs_input_ids)
@@ -238,7 +240,7 @@ class PipelineScheduler1F1B:
                 hidden_states = self._recv_forward(
                     mb_size=mbs_input_ids[mb_idx].shape[0],
                     seq_len=mbs_input_ids[mb_idx].shape[1],
-                    d_model=self.stage.layers[0].d_model if self.stage.layers else 4096,
+                    d_model=self.stage.d_model,
                 )
             else:
                 hidden_states = None
@@ -253,7 +255,7 @@ class PipelineScheduler1F1B:
             # Send to next stage (if not last)
             if not self.stage.is_last:
                 self._send_forward(result["hidden_states"], mb_idx)
-            else:
+            elif mbs_labels is not None:
                 loss = self.stage.compute_loss(result["hidden_states"], mbs_labels[mb_idx])
                 fwd_queue.append((mb_idx, loss.detach(), result["hidden_states"]))
                 total_loss += loss.detach() * mbs_input_ids[mb_idx].numel()
@@ -275,7 +277,7 @@ class PipelineScheduler1F1B:
                 hidden_states = self._recv_forward(
                     mb_size=mbs_input_ids[mb_idx].shape[0],
                     seq_len=mbs_input_ids[mb_idx].shape[1],
-                    d_model=self.stage.layers[0].d_model if self.stage.layers else 4096,
+                    d_model=self.stage.d_model,
                 )
             else:
                 hidden_states = None
@@ -288,7 +290,7 @@ class PipelineScheduler1F1B:
 
             if not self.stage.is_last:
                 self._send_forward(result["hidden_states"], mb_idx)
-            else:
+            elif mbs_labels is not None:
                 loss = self.stage.compute_loss(result["hidden_states"], mbs_labels[mb_idx])
                 fwd_queue.append((mb_idx, loss.detach(), result["hidden_states"]))
                 total_loss += loss.detach() * mbs_input_ids[mb_idx].numel()
@@ -390,4 +392,5 @@ def shard_model_pp(
         final_norm=final_norm,
         lm_head_weight=lm_head_weight,
         vocab_size=model.config.vocab_size,
+        d_model=getattr(model.config, "d_model", 4096),
     )

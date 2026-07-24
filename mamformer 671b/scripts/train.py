@@ -98,28 +98,25 @@ class TextDataset(IterableDataset):
         import random
         random.seed(self.seed)
 
-        buffer = []
+        # Small carry-over buffer (list, kept small intentionally)
+        buffer: list = []
         for file_path in self.files:
-            # Memory-efficient: read in chunks instead of loading entire file
             raw_bytes = open(file_path, 'rb').read()
             data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
-            # Stream through data without creating giant Python list
-            data_list = data.tolist()
-            buffer.extend(data_list)
-            # Free memory
-            del data, data_list, raw_bytes
-
-            while len(buffer) >= self.seq_len + 1:
-                chunk = buffer[: self.seq_len + 1]
-                buffer = buffer[self.seq_len :]
+            # Iterate directly over the tensor with slicing -- no Python list conversion
+            pos = 0
+            n = data.shape[0]
+            while pos + self.seq_len + 1 <= n:
+                chunk = data[pos:pos + self.seq_len + 1]
+                pos += self.seq_len
                 yield {
-                    "input_ids": torch.tensor(chunk[:-1]),
-                    "labels": torch.tensor(chunk[1:]),
+                    "input_ids": chunk[:-1].clone(),
+                    "labels": chunk[1:].clone(),
                 }
-
-            # Periodically trim buffer to prevent unbounded growth
-            if len(buffer) > self.seq_len * 1024:
-                buffer = buffer[-self.seq_len * 512:]
+            # Carry-over: last partial chunk goes into the small buffer
+            if pos < n:
+                buffer.extend(data[pos:].tolist())
+            del data, raw_bytes
 
 
 # ── LR Schedule ────────────────────────────────────────────────────────
@@ -301,7 +298,7 @@ def train(config: dict) -> None:
 
     # Mixed precision
     amp_enabled = config.get("bf16", False) or config.get("fp16", False)
-    amp_dtype = torch.bfloat16 if config.get("bf16", False) else torch.float16 if config.get("fp16", False) else None
+    amp_dtype = torch.bfloat16 if config.get("bf16", False) else torch.float16 if config.get("fp16", False) else torch.float32
 
     # ── WandB ──────────────────────────────────────────────────
     use_wandb = config.get("use_wandb", False)
@@ -353,6 +350,9 @@ def train(config: dict) -> None:
             if "out of memory" in str(e).lower():
                 logger.error(f"OOM at step {global_step}! Clearing cache and skipping...")
                 torch.cuda.empty_cache()
+                # Clear partially-computed gradients before continuing
+                optimizer.zero_grad()
+                model.zero_grad(set_to_none=True)
                 # Save emergency checkpoint
                 save_checkpoint(model, optimizer, scheduler, global_step, output_dir, final=False, tag="oom_recovery")
                 continue
@@ -539,8 +539,8 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=8192)
     parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 mixed precision")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True,
-                       help="Enable gradient checkpointing (default: True)")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing (default: enabled)")
     parser.add_argument("--no_gradient_checkpointing", action="store_false", dest="gradient_checkpointing",
                        help="Disable gradient checkpointing")
     parser.add_argument("--output_dir", type=str, default="./checkpoints")

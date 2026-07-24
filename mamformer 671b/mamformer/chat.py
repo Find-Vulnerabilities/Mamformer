@@ -309,6 +309,11 @@ class ChatSession:
 
         # Build prompt with assistant start (so model knows to generate response)
         prompt = self.template.format_conversation(self.messages)
+        if self.messages and self.messages[-1].role == "assistant":
+            # If conversation already ends with assistant, trim the end marker
+            # to allow continuation rather than starting a duplicate assistant turn
+            if self.template.assistant_end and prompt.endswith(self.template.assistant_end):
+                prompt = prompt[:-len(self.template.assistant_end)]
         prompt += self.template.assistant_start
 
         # Encode
@@ -365,6 +370,9 @@ class ChatSession:
         self._trim_to_context()
 
         prompt = self.template.format_conversation(self.messages)
+        if self.messages and self.messages[-1].role == "assistant":
+            if self.template.assistant_end and prompt.endswith(self.template.assistant_end):
+                prompt = prompt[:-len(self.template.assistant_end)]
         prompt += self.template.assistant_start
 
         input_ids = self.tokenizer.encode(prompt, add_bos=False)
@@ -615,6 +623,7 @@ class ChatSession:
                 "top_k": self.top_k,
                 "top_p": self.top_p,
                 "max_new_tokens": self.max_new_tokens,
+                "repetition_penalty": self.repetition_penalty,
                 "reflection_mode": self.reflection_mode,
             },
         }
@@ -635,6 +644,7 @@ class ChatSession:
         session.top_k = config.get("top_k", 50)
         session.top_p = config.get("top_p", 0.9)
         session.max_new_tokens = config.get("max_new_tokens", 512)
+        session.repetition_penalty = config.get("repetition_penalty", 1.0)
 
         # Restore messages
         for msg in data.get("messages", []):

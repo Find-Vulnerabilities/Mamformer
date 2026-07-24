@@ -157,6 +157,69 @@ class CommunicativeMoEConfig:
 
 
 @dataclass
+class InterleaveConfig:
+    """
+    Layer-level attention interleaving configuration.
+
+    Controls which layers run full hybrid (Attention + SSM in parallel)
+    vs SSM-only. Reduces training/inference FLOPs by ~40-60% while
+    maintaining accuracy — all production hybrid LLMs (Jamba, Samba,
+    Zamba) use interleaving, not per-layer parallelism.
+
+    Pattern "attn_every_k":
+        Places one hybrid layer every K layers, with the first layer
+        and last N layers always hybrid. Example: k=4, n_layers=32
+        gives ~10 hybrid layers (1:3 ratio).
+
+    Pattern "custom":
+        Explicit list of layer indices that should have attention.
+    """
+
+    enabled: bool = False
+    pattern: str = "attn_every_k"       # "attn_every_k" | "custom"
+    attn_every_k: int = 4               # Hybrid layer every K layers
+    first_layer_attn: bool = True       # Layer 0 always has attention
+    last_layers_dense: int = 2          # Last N layers all have attention
+    attention_layers: list[int] = field(default_factory=list)  # "custom" explicit list
+
+    def resolve_attention_layers(self, n_layers: int) -> list[int]:
+        """
+        Compute which layer indices have attention based on the pattern.
+
+        Returns a sorted list of layer indices that should be hybrid
+        (attention + SSM). All other layers are SSM-only.
+        """
+        if self.pattern == "custom":
+            layers = set(self.attention_layers)
+            # Safety: clamp to valid range
+            layers = {i for i in layers if 0 <= i < n_layers}
+            if not layers:
+                raise ValueError(
+                    "InterleaveConfig.pattern='custom' but attention_layers "
+                    f"is empty or contains no valid indices for n_layers={n_layers}"
+                )
+            return sorted(layers)
+
+        # "attn_every_k" pattern
+        layers: set[int] = set()
+
+        # First layer always gets attention (important for embedding alignment)
+        if self.first_layer_attn:
+            layers.add(0)
+
+        # Every K layers
+        for i in range(0, n_layers, self.attn_every_k):
+            layers.add(i)
+
+        # Last N layers all have attention (critical for output quality)
+        if self.last_layers_dense > 0:
+            for i in range(max(0, n_layers - self.last_layers_dense), n_layers):
+                layers.add(i)
+
+        return sorted(layers)
+
+
+@dataclass
 class GenerationConfig:
     """
     Generation limits and defaults.
@@ -222,6 +285,7 @@ class MamformerConfig:
     kda_diff: KDADiffConfig = field(default_factory=KDADiffConfig)
     st_moe: STMoEConfig = field(default_factory=STMoEConfig)
     communicative_moe: CommunicativeMoEConfig = field(default_factory=CommunicativeMoEConfig)
+    interleave: InterleaveConfig = field(default_factory=InterleaveConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
 
     # ── Regularization ────────────────────────────────────────────────
@@ -315,7 +379,7 @@ class MamformerConfig:
 
     def _ffn_active_params(self) -> int:
         """Per-layer FFN active parameters."""
-        if self.moe.enabled:
+        if self.moe.enabled or self.st_moe.enabled:
             return (self.moe.n_shared_experts * 3 * self.d_model * self.moe.shared_expert_intermediate_dim
                     + self.moe.top_k * 3 * self.d_model * self.moe.routed_expert_intermediate_dim
                     + self.d_model * self.moe.n_routed_experts
@@ -425,6 +489,13 @@ class MamformerConfig:
             "comm_moe_n_heads": self.communicative_moe.n_comm_heads,
             "comm_moe_depth": self.communicative_moe.comm_depth,
             "comm_moe_dropout": self.communicative_moe.comm_dropout,
+            # Interleave
+            "interleave_enabled": self.interleave.enabled,
+            "interleave_pattern": self.interleave.pattern,
+            "interleave_attn_every_k": self.interleave.attn_every_k,
+            "interleave_first_layer_attn": self.interleave.first_layer_attn,
+            "interleave_last_layers_dense": self.interleave.last_layers_dense,
+            "interleave_attention_layers": self.interleave.attention_layers,
             # Generation
             "gen_max_context": self.generation.max_context,
             "gen_max_output_tokens": self.generation.max_output_tokens,
@@ -472,7 +543,7 @@ class MamformerConfig:
         )
         dsa_cfg = DSAConfig(
             enabled=d.get("dsa_enabled", False),
-            lambda_init=d.get("dsa_lambda_init", -0.2),
+            lambda_init=d.get("dsa_lambda_init", 0.8),
             use_state_injection=d.get("dsa_use_state_injection", True),
             state_injection_dim=d.get("dsa_state_injection_dim", 64),
             num_attn_groups=d.get("dsa_num_attn_groups", 2),
@@ -496,6 +567,14 @@ class MamformerConfig:
             n_comm_heads=d.get("comm_moe_n_heads", 4),
             comm_depth=d.get("comm_moe_depth", 1),
             comm_dropout=d.get("comm_moe_dropout", 0.0),
+        )
+        interleave_cfg = InterleaveConfig(
+            enabled=d.get("interleave_enabled", False),
+            pattern=d.get("interleave_pattern", "attn_every_k"),
+            attn_every_k=d.get("interleave_attn_every_k", 4),
+            first_layer_attn=d.get("interleave_first_layer_attn", True),
+            last_layers_dense=d.get("interleave_last_layers_dense", 2),
+            attention_layers=d.get("interleave_attention_layers", []),
         )
         gen_cfg = GenerationConfig(
             max_context=d.get("gen_max_context", d.get("max_seq_len", 8192)),
@@ -521,6 +600,7 @@ class MamformerConfig:
             mamba=mamba_cfg, rope=rope_cfg, moe=moe_cfg,
             dsa=dsa_cfg, mtp=mtp_cfg, st_moe=st_moe_cfg,
             communicative_moe=comm_moe_cfg,
+            interleave=interleave_cfg,
             generation=gen_cfg,
             dropout=d.get("dropout", 0.0),
             rms_norm_eps=d.get("rms_norm_eps", 1e-6),
@@ -575,6 +655,13 @@ class MamformerConfig:
                          "n_comm_heads": "comm_moe_n_heads",
                          "comm_depth": "comm_moe_depth",
                          "comm_dropout": "comm_moe_dropout"})
+        _flatten_nested(d, "interleave",
+                        {"enabled": "interleave_enabled",
+                         "pattern": "interleave_pattern",
+                         "attn_every_k": "interleave_attn_every_k",
+                         "first_layer_attn": "interleave_first_layer_attn",
+                         "last_layers_dense": "interleave_last_layers_dense",
+                         "attention_layers": "interleave_attention_layers"})
         _flatten_nested(d, "generation",
                         {"max_context": "gen_max_context",
                          "max_output_tokens": "gen_max_output_tokens",
@@ -651,6 +738,11 @@ class MamformerConfig:
             lines.append(f"  ST-MoE:          ENABLED (λ={self.st_moe.lambda_init}, max={self.st_moe.lambda_max}, balance_lock)")
         if self.communicative_moe.enabled:
             lines.append(f"  CommunicativeMoE:ENABLED ({self.communicative_moe.n_comm_heads} heads, depth={self.communicative_moe.comm_depth})")
+        if self.interleave.enabled:
+            attn_layers = self.interleave.resolve_attention_layers(self.n_layers)
+            lines.append(f"  Interleave:       ENABLED ({len(attn_layers)}/{self.n_layers} hybrid, "
+                         f"{self.n_layers - len(attn_layers)} SSM-only, "
+                         f"pattern={self.interleave.pattern})")
         if self.rope.use_yarn:
             lines.append(f"  YaRN:            scale={self.rope.yarn_scale}x, theta={self.rope.theta}")
         lines += [
@@ -712,6 +804,8 @@ def _make_ultra_7b() -> MamformerConfig:
                        aux_loss_free=True, bias_update_speed=0.001),
         dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
+        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2),
         generation=GenerationConfig(max_context=8192, max_output_tokens=4096,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -733,6 +827,8 @@ def _make_ultra_37b() -> MamformerConfig:
                        aux_loss_free=True, bias_update_speed=0.001),
         dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
+        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2),
         generation=GenerationConfig(max_context=131072, max_output_tokens=32768,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -754,6 +850,8 @@ def _make_ultra_371b() -> MamformerConfig:
                        aux_loss_free=True, bias_update_speed=0.001),
         dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
+        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2),
         generation=GenerationConfig(max_context=262144, max_output_tokens=65536,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )
@@ -775,6 +873,8 @@ def _make_ultra_671b() -> MamformerConfig:
                        aux_loss_free=True, bias_update_speed=0.001),
         dsa=DSAConfig(enabled=True, lambda_init=0.8, use_state_injection=True, state_injection_dim=64),
         mtp=MTPConfig(enabled=True, depth=2, loss_weight=0.3),
+        interleave=InterleaveConfig(enabled=True, pattern="attn_every_k", attn_every_k=4,
+                                     first_layer_attn=True, last_layers_dense=2),
         generation=GenerationConfig(max_context=1048576, max_output_tokens=163800,
                                      default_temperature=0.7, default_top_k=50, default_top_p=0.9),
     )

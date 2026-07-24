@@ -497,6 +497,11 @@ class RewardCalculator:
 
             # Get type-specific kwargs
             type_kwargs = kwargs.pop(rtype, {})
+            if not isinstance(type_kwargs, dict):
+                raise TypeError(
+                    f"Expected dict for reward type '{rtype}' kwargs, "
+                    f"got {type(type_kwargs).__name__}"
+                )
             score = rfn(response, **type_kwargs)
             total += weight * score
             total_weight += weight

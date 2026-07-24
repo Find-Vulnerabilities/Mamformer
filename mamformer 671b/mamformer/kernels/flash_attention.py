@@ -112,14 +112,14 @@ def flash_attn_gqa(
 
     training = dropout_p > 0
     if backend == "flash_attn":
-        return _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale)
+        return _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale, sliding_window)
     elif backend == "sdpa":
         return _sdpa_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale)
     else:
         return _manual_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale, training=training)
 
 
-def _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, scale):
+def _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, scale, sliding_window=0):
     """Use Dao-AILab flash-attention library."""
     from flash_attn import flash_attn_func
 
@@ -128,10 +128,21 @@ def _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, scale):
     k = k.transpose(1, 2).contiguous()
     v = v.transpose(1, 2).contiguous()
 
-    window_size = (-1, -1)  # No sliding window in this call
+    if sliding_window > 0:
+        window_size = (sliding_window - 1, 0)
+    else:
+        window_size = (-1, -1)
+
     if mask is not None and mask.dim() == 4:
-        # Convert additive mask to boolean if needed
-        pass  # flash_attn handles masks differently
+        # flash_attn does not support arbitrary attention masks natively.
+        # If the mask was built by _build_sliding_window_causal_mask, the
+        # sliding_window parameter above covers it. Otherwise, raise.
+        if sliding_window <= 0:
+            raise NotImplementedError(
+                "flash_attn backend does not support arbitrary attention masks. "
+                "Use sdpa or manual backend, or set attention_mask=None and "
+                "is_causal=True for causal-only masking."
+            )
 
     output = flash_attn_func(
         q, k, v,
@@ -294,7 +305,7 @@ def flash_attn_with_sliding_window(
     )
 
     if backend == "flash_attn":
-        return _flash_attn_impl(q, k, v, False, mask, dropout_p, softmax_scale)
+        return _flash_attn_impl(q, k, v, False, mask, dropout_p, softmax_scale, window_size)
     elif backend == "sdpa":
         return _sdpa_impl(q, k, v, False, mask, dropout_p, softmax_scale)
     else:

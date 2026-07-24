@@ -42,6 +42,14 @@ model:
     depth: 2
     loss_weight: 0.3
 
+  # Interleaved Attention: 1:3 ratio (10 hybrid / 22 SSM-only)
+  interleave:
+    enabled: true
+    pattern: "attn_every_k"
+    attn_every_k: 4
+    first_layer_attn: true
+    last_layers_dense: 2
+
   rope:
     theta: 1000000.0
     use_yarn: true

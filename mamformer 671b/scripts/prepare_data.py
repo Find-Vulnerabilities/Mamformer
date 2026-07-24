@@ -139,15 +139,35 @@ def tokenize_and_save(
         if total_docs % 10000 == 0:
             print(f"  Processed {total_docs:,} docs, {total_tokens:,} tokens")
 
-    # Flush remaining tokens (discard incomplete chunks to avoid padding)
-    if len(buffer) >= seq_len + 1:
-        chunk = buffer[: seq_len + 1]
+    # Flush remaining tokens (condition len(buffer) >= seq_len + 1 is always
+    # False after the while loop, so this was dead code; write partial chunk
+    # as the last chunk if buffer has any tokens)
+    if len(buffer) > 0:
+        if len(buffer) >= seq_len + 1:
+            chunk = buffer[: seq_len + 1]
+        else:
+            # Pad the final incomplete chunk with zeros (will be masked by labels)
+            chunk = list(buffer) + [0] * (seq_len + 1 - len(buffer))
         arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)
         arr.tofile(current_shard_path)
         shard_size += 1
 
     print(f"\nDone! {total_docs:,} documents -> {total_tokens:,} tokens")
     print(f"Saved {shard_idx + 1} shards to {output_dir}/")
+
+    # Write metadata JSON so readers know the dtype and sequence length
+    dtype_str = "uint16" if tokenizer.vocab_size < 65536 else "uint32"
+    metadata = {
+        "dtype": dtype_str,
+        "seq_len": seq_len,
+        "total_tokens": total_tokens,
+        "vocab_size": tokenizer.vocab_size,
+        "num_shards": shard_idx + 1,
+    }
+    meta_path = output_dir / "metadata.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Metadata saved to {meta_path}")
 
 
 def main():

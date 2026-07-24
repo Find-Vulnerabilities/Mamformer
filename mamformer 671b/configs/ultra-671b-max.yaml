@@ -69,6 +69,16 @@ model:
     depth: 2
     loss_weight: 0.3
 
+  # ── Interleaved Attention ────────────────────────────────────
+  # 1:3 ratio: 15 hybrid layers out of 52 total
+  # Reduces attention FLOPs by ~70% vs all-hybrid
+  interleave:
+    enabled: true
+    pattern: "attn_every_k"
+    attn_every_k: 4
+    first_layer_attn: true
+    last_layers_dense: 2
+
   # ── YaRN: 128x context scaling (8K → 1M) ──────────────────────
   rope:
     theta: 50000000.0        # Massive theta for 1M context

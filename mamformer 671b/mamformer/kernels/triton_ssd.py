@@ -200,6 +200,14 @@ else:
 
 
 # ── Fused Triton Kernel ───────────────────────────────────────────────
+#
+# NOTE (WIP): _fused_ssd_kernel is currently defined but NOT called by any
+# production code path.  triton_selective_scan_fused (below) deliberately
+# falls back to a staged projection-then-scan pipeline for numerical
+# reliability.  Full kernel fusion (dt proj + scan in one launch) remains
+# a future optimization; the kernel definition here serves as reference
+# for that work.  Do not remove it without updating triton_selective_scan_fused
+# and its callers first.
 
 if is_triton_available():
     import triton

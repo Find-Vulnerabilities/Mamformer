@@ -54,7 +54,9 @@ def load_model(
 
     if checkpoint_path:
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        # weights_only=False: checkpoints may contain optimizer state dicts
+        # which are not safe to deserialize with weights_only=True in PyTorch 2.6+
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if "model" in checkpoint:
             state_dict = checkpoint["model"]
         else:
@@ -192,7 +194,7 @@ def main():
         repetition_penalty=args.repetition_penalty,
         num_beams=args.num_beams,
         eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
 
     if args.prompt:

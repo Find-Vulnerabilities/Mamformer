@@ -270,6 +270,10 @@ class CommunicativeMoE(nn.Module):
         else:
             router_logits = base.router(x)
 
+        # ── Temperature scaling (mirrors ST-MoE and DeepSeekMoE) ───
+        if base.router_temperature != 1.0:
+            router_logits = router_logits / base.router_temperature
+
         # ── 3. Aux-loss-free bias ──────────────────────────────────
         if base.aux_loss_free and self.training:
             gating_scores = router_logits + base.expert_bias

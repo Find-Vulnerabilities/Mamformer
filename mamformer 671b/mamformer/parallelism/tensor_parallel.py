@@ -102,6 +102,10 @@ def _tp_reduce_scatter(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
     group = _get_tp_group()
     if group is not None and dist.is_initialized():
         world_size = dist.get_world_size(group)
+        assert tensor.shape[dim] % world_size == 0, (
+            f"Tensor size {tensor.shape[dim]} along dim {dim} must be "
+            f"divisible by world_size {world_size}"
+        )
         chunk_size = tensor.shape[dim] // world_size
         output = torch.empty(
             *tensor.shape[:dim], chunk_size, *tensor.shape[dim+1:],
@@ -497,10 +501,13 @@ class TPMamba2Block(nn.Module):
     def _causal_conv1d(self, x, cache=None):
         batch, seqlen, d_inner = x.shape
         if cache is not None and "conv_state" in cache:
+            # Cached conv_state already provides the (d_conv-1) context;
+            # prepend it and skip the explicit F.pad to avoid double-padding.
             x_padded = torch.cat([cache["conv_state"], x], dim=1)
+            x_padded = x_padded.transpose(1, 2)
         else:
             x_padded = x
-        x_padded = F.pad(x_padded.transpose(1, 2), (self.d_conv - 1, 0))
+            x_padded = F.pad(x_padded.transpose(1, 2), (self.d_conv - 1, 0))
         x_conv = self.conv1d(x_padded)
         return x_conv.transpose(1, 2)
 

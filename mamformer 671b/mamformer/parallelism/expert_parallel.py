@@ -521,6 +521,7 @@ class EPMoE(nn.Module):
         actual_load = expert_counts / (total_tokens * self.top_k + 1e-8)
         expected_load = 1.0 / self.n_routed_experts_total
         self.expert_bias -= self.bias_update_speed * torch.sign(actual_load - expected_load)
+        self.expert_load_ema = 0.99 * self.expert_load_ema + 0.01 * actual_load
 
 
 from mamformer.layers.moe import _SwiGLUExpert  # noqa: E402 (import after class def)

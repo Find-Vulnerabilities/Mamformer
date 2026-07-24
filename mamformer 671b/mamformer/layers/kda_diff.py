@@ -624,12 +624,12 @@ class FullDiffAttention(nn.Module):
         attn_logits_2 = torch.matmul(q2, k.transpose(-2, -1)) * scale
 
         # Causal mask
+        kv_len = k.shape[2]
+        q_len = q1.shape[2]
         if attention_mask is not None:
             attn_logits_1 = attn_logits_1 + attention_mask
             attn_logits_2 = attn_logits_2 + attention_mask
         else:
-            kv_len = k.shape[2]
-            q_len = q1.shape[2]
             causal_mask = torch.triu(
                 torch.full((q_len, kv_len), torch.finfo(attn_logits_1.dtype).min,
                           device=x.device, dtype=attn_logits_1.dtype),
@@ -637,6 +637,12 @@ class FullDiffAttention(nn.Module):
             ).unsqueeze(0).unsqueeze(0)
             attn_logits_1 = attn_logits_1 + causal_mask
             attn_logits_2 = attn_logits_2 + causal_mask
+
+        # Sliding window mask (on top of causal)
+        if self.sliding_window > 0:
+            sw_mask = self._build_sliding_window_mask(q_len, kv_len, x.device, attn_logits_1.dtype)
+            attn_logits_1 = attn_logits_1 + sw_mask
+            attn_logits_2 = attn_logits_2 + sw_mask
 
         # Differential combination
         lam = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
@@ -659,6 +665,19 @@ class FullDiffAttention(nn.Module):
 
         output = self.o_proj(attn_output)
         return output, new_cache
+
+    def _build_sliding_window_mask(
+        self, q_len: int, kv_len: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Build sliding window additive mask for full differential attention."""
+        offset = kv_len - q_len
+        indices_q = torch.arange(q_len, device=device).unsqueeze(1)
+        indices_k = torch.arange(kv_len, device=device).unsqueeze(0)
+        distances = indices_k - indices_q
+        valid = (distances >= 0) & (distances < self.sliding_window)
+        mask = torch.zeros(q_len, kv_len, device=device, dtype=dtype)
+        mask = mask.masked_fill(~valid, float("-inf"))
+        return mask.unsqueeze(0).unsqueeze(0)
 
     def get_lambda_values(self) -> torch.Tensor:
         return torch.sigmoid(self.lambda_raw).detach()
@@ -837,8 +856,12 @@ class KDADiffAttention(nn.Module):
         # Both sub-modules have their own o_proj; this is the final blend
         self.output_mix = nn.Parameter(torch.zeros(1))  # sigmoid(0) = 0.5 blend
 
-        # ── Layer index counter (set externally by the model) ───────
+        # ── Layer index (set externally by MamformerBlock) ───────────
         self.register_buffer("layer_idx", torch.tensor(0, dtype=torch.long))
+
+    def set_layer_idx(self, idx: int) -> None:
+        """Set the layer index for fixed interleaving pattern."""
+        self.layer_idx.fill_(idx)
 
     def _is_full_attention_layer(self) -> bool:
         """Check if this layer should use full attention (fixed pattern)."""
@@ -866,29 +889,26 @@ class KDADiffAttention(nn.Module):
             (output, cache)
         """
         if self.use_dynamic_ratio and h_states is not None:
-            # ── Dynamic: blend both based on SSM state ──────────────
+            # ── Dynamic: soft blend based on SSM state complexity ────
+            # ratio is per-token (B, S, 1): high → needs full attention
             ratio = self.interleave_gate(h_states)  # (B, S, 1)
+            # Aggregate to a single global decision for this forward pass
+            # (per-token decisions would require computing both anyway)
+            avg_ratio = ratio.mean().item()
 
-            linear_out, linear_cache = self.linear_attn(
-                x, attention_mask=attention_mask,
-                use_cache=use_cache, cache=cache,
-                h_states=h_states,
-            )
-            full_out, full_cache = self.full_attn(
-                x, attention_mask=attention_mask,
-                use_cache=use_cache, cache=cache,
-                h_states=h_states,
-            )
-
-            # Blend: ratio=1 → all full, ratio=0 → all linear
-            mix = torch.sigmoid(self.output_mix)
-            output = (1.0 - mix) * linear_out + mix * full_out
-
-            # Also weight by dynamic ratio
-            output = (1.0 - ratio) * output + ratio * full_out
-
-            # Use linear cache (simpler, always available)
-            new_cache = linear_cache if use_cache else None
+            # Threshold: >0.5 → use full attention, else linear
+            if avg_ratio > 0.5:
+                output, new_cache = self.full_attn(
+                    x, attention_mask=attention_mask,
+                    use_cache=use_cache, cache=cache,
+                    h_states=h_states,
+                )
+            else:
+                output, new_cache = self.linear_attn(
+                    x, attention_mask=attention_mask,
+                    use_cache=use_cache, cache=cache,
+                    h_states=h_states,
+                )
 
         elif self._is_full_attention_layer():
             # ── Fixed: full attention layer ─────────────────────────

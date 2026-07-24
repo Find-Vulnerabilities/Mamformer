@@ -186,7 +186,11 @@ def evaluate_multiple_choice(
         choice_scores = []
         for choice_text in choices:
             full_text = prompt + choice_text
-            input_ids = tokenizer.encode(full_text, add_bos=True, max_length=2048, truncation=True)
+            input_ids = tokenizer.encode(full_text, add_bos=True)
+            # Truncate if longer than 2048 tokens (post-processing to avoid
+            # relying on tokenizer kwargs that may not be supported)
+            if len(input_ids) > 2048:
+                input_ids = input_ids[:2048]
             input_tensor = torch.tensor([input_ids], device=device)
 
             outputs = model(input_ids=input_tensor)
@@ -405,8 +409,10 @@ def evaluate_humaneval(
         )
 
         generated = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
-        # Extract the model's continuation after the prompt
-        completion = generated[len(prompt):] if generated.startswith(prompt) else generated
+        # Use token-level slicing: more reliable than text-level comparison
+        # which is fragile after tokenization round-trip
+        completion_ids = output_ids[0, len(input_ids):]
+        completion = tokenizer.decode(completion_ids.tolist(), skip_special_tokens=True)
 
         # Check for syntactic validity
         try:
@@ -458,7 +464,7 @@ def evaluate(
 
     if checkpoint_path and Path(checkpoint_path).exists():
         print(f"Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         state_dict = checkpoint.get("model", checkpoint)
         model.load_state_dict(state_dict, strict=False)
 

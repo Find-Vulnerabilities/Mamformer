@@ -319,10 +319,13 @@ class Deduplicator:
       2. Exact span matching for precise overlap removal
     """
 
-    def __init__(self, threshold: float = 0.8, num_hashes: int = 128):
+    def __init__(self, threshold: float = 0.8, num_hashes: int = 128, num_bands: int = 16):
         self.threshold = threshold
         self.num_hashes = num_hashes
-        self._seen_hashes: Set[int] = set()
+        self.num_bands = num_bands
+        self._rows_per_band = num_hashes // num_bands
+        # Banded LSH buckets: band_idx -> {bucket_key: set()}
+        self._buckets: Dict[int, Dict[str, set]] = defaultdict(dict)
         self._seen_spans: Set[str] = set()
         self._removed_count = 0
 
@@ -354,6 +357,10 @@ class Deduplicator:
         """
         Check if text is a duplicate of previously seen content.
 
+        Uses banded LSH with MinHash for near-duplicate detection.
+        All hashing uses hashlib.md5 for deterministic, reproducible results
+        (Python's built-in hash() uses a random seed).
+
         Returns:
             (is_duplicate, reason)
         """
@@ -364,21 +371,31 @@ class Deduplicator:
             self._removed_count += 1
             return True, "exact_span"
 
-        # Check 2: MinHash near-dedup
+        # Check 2: Banded LSH near-dedup with deterministic MD5 hashing
         sig = self._minhash_signature(text)
-        sig_tuple = tuple(sig)
-        sig_hash = hash(sig_tuple)
 
-        if self._seen_hashes:
-            # Compare against all seen (simplified — production uses LSH buckets)
-            # For now: hash the full signature and check exact match
-            # (signature collision = very likely near-duplicate)
-            if sig_hash in self._seen_hashes:
-                self._removed_count += 1
-                return True, "near_dup"
+        # Check each band: if ALL rows in a band match a previously seen
+        # signature, it's a candidate near-duplicate
+        for band_idx in range(self.num_bands):
+            start = band_idx * self._rows_per_band
+            end = start + self._rows_per_band
+            band = tuple(sig[start:end])
+            # Deterministic hash of the band (unlike Python's seeded hash())
+            band_key = hashlib.md5(str(band).encode()).hexdigest()
 
-        # Not a duplicate — store and allow
-        self._seen_hashes.add(sig_hash)
+            bucket = self._buckets[band_idx]
+            if band_key in bucket:
+                # Candidate found: verify Jaccard similarity against stored sigs
+                for stored_sig in bucket[band_key]:
+                    if self._jaccard_estimate(sig, stored_sig) >= self.threshold:
+                        self._removed_count += 1
+                        return True, "near_dup"
+                # Below threshold: add to bucket but don't reject
+                bucket[band_key].add(tuple(sig))
+            else:
+                bucket[band_key] = {tuple(sig)}
+
+        # Not a duplicate — store span hash and allow
         self._seen_spans.add(span_hash)
         return False, ""
 
@@ -853,8 +870,9 @@ class DataPipeline:
         report = pipeline.process("/data/raw/", "/data/processed/")
     """
 
-    def __init__(self, config: Optional[DataMixConfig] = None):
+    def __init__(self, config: Optional[DataMixConfig] = None, override_domain: Optional[str] = None):
         self.config = config or DataMixConfig()
+        self.override_domain = override_domain
         self.classifier = DomainClassifier()
         self.scorer = QualityScorer(
             min_length=self.config.min_doc_length,
@@ -898,6 +916,9 @@ class DataPipeline:
 
             # Step 5: Classify
             domain, confidence, _ = self.classifier.classify(text)
+            # Override domain if --domain CLI flag was set
+            if self.override_domain:
+                domain = self.override_domain
 
             # Add to mixer
             self.mixer.add_document(text, domain, quality)
@@ -1028,7 +1049,7 @@ def main():
         for k in config.weights:
             config.weights[k] /= total_weight
 
-    pipeline = DataPipeline(config)
+    pipeline = DataPipeline(config, override_domain=args.domain)
 
     if args.report_only:
         print(pipeline.generate_report())

@@ -36,6 +36,7 @@ def selective_scan(
     C: torch.Tensor,
     D: torch.Tensor,
     return_h_states: bool = False,
+    return_final_state: bool = False,
 ):
     """
     Mamba-2 selective scan (SSD kernel) — pure PyTorch sequential implementation.
@@ -54,13 +55,12 @@ def selective_scan(
         C: Input-dependent output projection (batch, seqlen, d_state)
         D: Skip connection weight (d_inner,)
         return_h_states: If True, also return per-timestep h-state summaries.
-                         h_states[t] = mean-pool over d_inner of h at step t.
-                         Shape: (batch, seqlen, d_state)
+        return_final_state: If True, return the final hidden state h_T.
+                           Shape: (batch, d_inner, d_state) — used for cache.
 
     Returns:
         y: Output tensor (batch, seqlen, d_inner)
-        h_states: (only if return_h_states=True)
-                  Per-timestep SSM state summaries (batch, seqlen, d_state)
+        (plus h_states and/or final_state as requested)
     """
     batch, seqlen, d_inner = x.shape
     d_state = A.shape[0]
@@ -100,9 +100,16 @@ def selective_scan(
     # Add skip connection
     y = y + D.view(1, 1, d_inner) * x
 
+    # Return requested outputs
+    result = [y]
     if return_h_states:
-        return y, h_states
-    return y
+        result.append(h_states)
+    if return_final_state:
+        result.append(h)  # (batch, d_inner, d_state) — state after last position
+
+    if len(result) == 1:
+        return result[0]
+    return tuple(result)
 
 
 def selective_scan_sequential(
@@ -288,16 +295,23 @@ class Mamba2Block(nn.Module):
 
         # Selective scan (SSD kernel) with proper state caching
         h_states = None
-        new_ssm_state = None
+        final_h_state = None
         if use_cache and cache is not None and cache.get("ssm_state") is not None:
-            y, new_ssm_state = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
+            # ── Incremental step: use recurrent formulation with previous state ──
+            y, final_h_state = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
         else:
+            # ── Full sequence scan ──
             scan_result = selective_scan(
                 x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
                 return_h_states=return_h_states,
+                return_final_state=use_cache,  # Need final state for cache
             )
-            if return_h_states:
+            if return_h_states and use_cache:
+                y, h_states, final_h_state = scan_result
+            elif return_h_states:
                 y, h_states = scan_result
+            elif use_cache:
+                y, final_h_state = scan_result
             else:
                 y = scan_result
 
@@ -308,23 +322,24 @@ class Mamba2Block(nn.Module):
         # Output projection
         out = self.out_proj(y)
 
-        # Build cache with correct conv_state and ssm_state preservation
+        # Build cache with correct SSM state preservation
         new_cache = None
         if use_cache:
-            # Compute SSM state at the last position for next step
-            # Always compute it, regardless of seqlen
-            dt_last = dt[:, -1:]  # (batch, 1, d_inner)
-            B_last = B[:, -1:]    # (batch, 1, d_state)
-            x_last = x_act[:, -1:]  # (batch, 1, d_inner)
-            A_param = torch.exp(self.A_log)
-            A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
-            B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
-            new_ssm_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]  # (batch, d_inner, d_state)
+            # Use the correctly-computed final h state (from recurrent_step or scan)
+            if final_h_state is None:
+                # Fallback: compute from last position
+                dt_last = dt[:, -1:]
+                B_last = B[:, -1:]
+                x_last = x_act[:, -1:]
+                A_param = torch.exp(self.A_log)
+                A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
+                B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
+                final_h_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]
+            new_ssm_state = final_h_state
 
             # Compute conv state (last d_conv-1 positions of x before activation)
             conv_x = x[:, -(self.d_conv - 1):] if x.shape[1] >= self.d_conv else x
             if cache is not None and "conv_state" in cache:
-                # Extend existing conv state for single-token inference
                 conv_x = torch.cat([cache["conv_state"], conv_x], dim=1)[:, -(self.d_conv - 1):]
             new_conv_state = conv_x
 

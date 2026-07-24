@@ -309,6 +309,7 @@ def compute_moe_entropy_loss(
     if not entropies:
         return torch.tensor(0.0)
 
+    device = entropies[0].device if entropies else None
     losses = []
     for h in entropies:
         if h.numel() > 0:
@@ -317,4 +318,4 @@ def compute_moe_entropy_loss(
 
     if losses:
         return weight * torch.stack(losses).mean()
-    return torch.tensor(0.0)
+    return torch.tensor(0.0, device=device) if device is not None else torch.tensor(0.0)

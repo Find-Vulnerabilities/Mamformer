@@ -65,7 +65,7 @@ def profile_model(config: MamformerConfig, seq_len: int, batch_size: int) -> Non
     print(f"  Building model...")
 
     model = MamformerForCausalLM(config)
-    actual_total = model.num_parameters()
+    actual_total = sum(p.numel() for p in model.parameters())
     print(f"  Actual total:    {actual_total:>15,}  ({actual_total/1e9:.2f}B)")
 
     # -- Memory Analysis --
@@ -97,7 +97,7 @@ def profile_model(config: MamformerConfig, seq_len: int, batch_size: int) -> Non
     # SSM state memory (for inference)
     ssm_state_bytes = (
         config.n_layers
-        * config.d_inner
+        * (config.d_model * config.mamba.expand)
         * config.mamba.d_state
         * 2  # BF16
     )

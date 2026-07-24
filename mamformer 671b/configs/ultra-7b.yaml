@@ -58,6 +58,14 @@ model:
     loss_weight: 0.3                   # α for MTP auxiliary loss
     mtp_d_model: 0                     # 0 = share d_model with main model
 
+  # Interleaved Attention: 1:3 ratio (10 hybrid / 22 SSM-only)
+  interleave:
+    enabled: true
+    pattern: "attn_every_k"
+    attn_every_k: 4
+    first_layer_attn: true
+    last_layers_dense: 2
+
   # RoPE settings
   rope:
     theta: 1000000.0    # Increased for better long-context extrapolation

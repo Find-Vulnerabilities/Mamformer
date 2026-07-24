@@ -328,9 +328,6 @@ class PipelineBubbleAnalyzer:
 
     def record_step(self, compute_time: float, idle_time: float):
         """Record actual times for one pipeline step."""
-        if not hasattr(self, '_total_compute_time'):
-            self._total_compute_time = 0.0
-        self._total_compute_time += compute_time
         self._total_idle_time += idle_time
         self._total_step_time += compute_time + idle_time
         self._step_count += 1

@@ -80,11 +80,11 @@ class ReflectionModule(nn.Module):
 
         # ── Reflection Token Generator ───────────────────────────
         # Generates critique tokens that describe issues found
-        self.critique_head = nn.Linear(d_model, vocab_size, bias=False)
         if embedding_weight is not None:
-            # Properly tie embeddings: avoid direct weight assignment
-            # which does not register the tensor as a nn.Parameter
-            self.critique_head.weight = nn.Parameter(embedding_weight.data.clone())
+            self.critique_weight = nn.Parameter(embedding_weight.data.clone())
+        else:
+            self.critique_weight = nn.Parameter(torch.empty(vocab_size, d_model))
+            nn.init.normal_(self.critique_weight, std=0.02)
 
         # ── Refinement Adapter ──────────────────────────────────
         # Takes the reflection summary and original hidden states
@@ -96,9 +96,11 @@ class ReflectionModule(nn.Module):
         )
 
         # ── Refinement Head ─────────────────────────────────────
-        self.refine_head = nn.Linear(d_model, vocab_size, bias=False)
         if embedding_weight is not None:
-            self.refine_head.weight = nn.Parameter(embedding_weight.data.clone())
+            self.refine_weight = nn.Parameter(embedding_weight.data.clone())
+        else:
+            self.refine_weight = nn.Parameter(torch.empty(vocab_size, d_model))
+            nn.init.normal_(self.refine_weight, std=0.02)
 
         # ── Confidence Scorer ───────────────────────────────────
         # Predicts whether reflection actually improved quality
@@ -144,13 +146,20 @@ class ReflectionModule(nn.Module):
         # Weight by token position (later tokens more important)
         pooled = hidden_states.mean(dim=1)  # (batch, d_model)
 
+        # Embed generated tokens to capture surface-form information
+        gen_embeds = F.embedding(generated_tokens, self.critique_weight)  # (batch, genlen, d_model)
+        pooled_tokens = gen_embeds.mean(dim=1)  # (batch, d_model)
+
+        # Combine hidden-state representation with token-level information
+        pooled = pooled + pooled_tokens
+
         # Normalize and project
         pooled_norm = self.reflection_norm(pooled)
         reflection_summary = self.reflection_proj(pooled_norm)  # (batch, d_model)
 
         # ── 2. Generate critique ────────────────────────────────
         # Project to vocabulary to get critique tokens
-        critique_logits = self.critique_head(reflection_summary.unsqueeze(1))  # (batch, 1, vocab_size)
+        critique_logits = F.linear(reflection_summary.unsqueeze(1), self.critique_weight)  # (batch, 1, vocab_size)
 
         # ── 3. Refine hidden states ─────────────────────────────
         # Concatenate reflection summary with original hidden states
@@ -160,7 +169,7 @@ class ReflectionModule(nn.Module):
         refined_states = self.refine_adapter(concat_states)  # (batch, seqlen, d_model)
 
         # ── 4. Generate refined output ──────────────────────────
-        refined_logits = self.refine_head(refined_states)  # (batch, seqlen, vocab_size)
+        refined_logits = F.linear(refined_states, self.refine_weight)  # (batch, seqlen, vocab_size)
 
         # ── 5. Confidence scoring ───────────────────────────────
         conf = self.confidence(reflection_summary)  # (batch, 1)

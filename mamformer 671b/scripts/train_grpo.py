@@ -383,6 +383,13 @@ def train_grpo(config: dict) -> None:
 
     # ── GRPO Hyperparameters ─────────────────────────────────
     G = config.get("group_size", 8)
+    if G < 2 and global_rank == 0:
+        logger.warning(
+            "GRPO group_size (G=%d) < 2: group-relative advantages will always be 0 "
+            "(single sample per group yields zero mean and zero std). "
+            "Set --group_size >= 2 for meaningful training.",
+            G,
+        )
     kl_beta = config.get("kl_beta", 0.04)
     gen_max_tokens = config.get("gen_max_tokens", 1024)
     gen_temperature = config.get("gen_temperature", 1.0)
@@ -530,7 +537,6 @@ def train_grpo(config: dict) -> None:
         prompt_mask[:, :prompt_len] = 1  # Mask prompt positions
         labels = labels.masked_fill(prompt_mask.bool(), -100)
         # Also mask padding in responses
-        resp_mask = torch.zeros(B * G, max_resp_len, dtype=torch.bool, device=device)
         for g_idx in range(G):
             cur_len = all_response_ids[g_idx].shape[1]
             for b_idx in range(B):
@@ -542,7 +548,7 @@ def train_grpo(config: dict) -> None:
         policy_log_probs_flat = torch.zeros(B * G, device=device)
 
         # Process in sub-batches to manage memory
-        sub_batch_size = config.get("sub_batch_size", B * G)
+        sub_batch_size = config.get("sub_batch_size") or B * G
         for start in range(0, B * G, sub_batch_size):
             end = min(start + sub_batch_size, B * G)
             sub_input = full_input_ids[start:end]
@@ -798,13 +804,14 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--max_prompt_len", type=int, default=2048)
-    parser.add_argument("--sub_batch_size", type=int, default=8,
-                       help="Sub-batch size for log-prob computation (memory management)")
+    parser.add_argument("--sub_batch_size", type=int, default=0,
+                       help="Sub-batch size for log-prob computation (0 = auto = B * G)")
 
     # Precision
     parser.add_argument("--bf16", action="store_true", help="Use BF16 mixed precision")
     parser.add_argument("--fp16", action="store_true", help="Use FP16 mixed precision")
-    parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                       help="Enable gradient checkpointing (default: enabled)")
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
 
     # I/O

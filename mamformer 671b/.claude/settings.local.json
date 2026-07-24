@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_hybrid.py tests/test_model.py tests/test_attention.py tests/test_mamba2.py tests/test_norm.py -v)"
+    ]
+  }
+}

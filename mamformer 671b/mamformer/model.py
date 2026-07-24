@@ -50,7 +50,13 @@ class MamformerModel(nn.Module):
             config.vocab_size, config.d_model
         )
 
-        # Stack of hybrid Mamformer blocks
+        # Resolve attention layers for interleaving
+        if config.interleave.enabled:
+            attention_layers = set(config.interleave.resolve_attention_layers(config.n_layers))
+        else:
+            attention_layers = set(range(config.n_layers))  # All layers hybrid
+
+        # Stack of hybrid Mamformer blocks (attention layers) + SSM-only blocks
         self.layers = nn.ModuleList([
             MamformerBlock(
                 d_model=config.d_model,
@@ -66,6 +72,9 @@ class MamformerModel(nn.Module):
                 dropout=config.dropout,
                 rms_norm_eps=config.rms_norm_eps,
                 sliding_window=config.sliding_window if config.use_sliding_window else 0,
+                # Attention control
+                has_attention=(i in attention_layers),
+                layer_idx=i,
                 # DSA options
                 use_dsa=config.dsa.enabled and not config.kda_diff.enabled,
                 dsa_lambda_init=config.dsa.lambda_init,
@@ -102,7 +111,7 @@ class MamformerModel(nn.Module):
                 comm_moe_depth=config.communicative_moe.comm_depth,
                 comm_moe_dropout=config.communicative_moe.comm_dropout,
             )
-            for _ in range(config.n_layers)
+            for i in range(config.n_layers)
         ])
 
         # Final normalization
@@ -243,6 +252,7 @@ class MamformerModel(nn.Module):
         attn_params = sum(
             p.numel()
             for layer in self.layers
+            if layer.has_attention
             for name, p in layer.attention.named_parameters()
         )
         ssm_params = sum(
@@ -256,13 +266,18 @@ class MamformerModel(nn.Module):
             for name, p in layer.ffn.named_parameters()
         )
 
+        n_hybrid = sum(1 for layer in self.layers if layer.has_attention)
+        n_ssm_only = sum(1 for layer in self.layers if not layer.has_attention)
+
         sep = "=" * 55
         print(sep)
         print("  Mamformer Model Parameter Summary")
         print(sep)
         print(f"  Embedding:     {embedding_params:>15,}")
+        if n_ssm_only > 0:
+            print(f"  Layers: {n_hybrid} hybrid + {n_ssm_only} SSM-only (x{len(self.layers)} total)")
         print(f"  Per-layer:")
-        print(f"    Attention:   {attn_params // len(self.layers):>15,}")
+        print(f"    Attention:   {attn_params // max(1, n_hybrid):>15,}")
         print(f"    SSM:         {ssm_params // len(self.layers):>15,}")
         print(f"    FFN:         {ffn_params // len(self.layers):>15,}")
         print(f"    Total/layer: {layer_params // len(self.layers):>15,}")
@@ -463,7 +478,6 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
         batch_size = input_ids.shape[0]
         device = input_ids.device
         rep_penalty = gen_cfg.repetition_penalty
-        dtype_min = torch.finfo(torch.float32).min
         generated = input_ids.clone()
         cache = None
         unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -504,7 +518,7 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
             if top_k > 0:
                 k = min(top_k, logits.size(-1))
                 top_k_values, _ = torch.topk(logits, k, dim=-1)
-                logits = logits.masked_fill(logits < top_k_values[:, -1:], dtype_min)
+                logits = logits.masked_fill(logits < top_k_values[:, -1:], torch.finfo(logits.dtype).min)
 
             # Top-p (nucleus) filtering
             if top_p < 1.0:
@@ -514,7 +528,7 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
                 sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
                 sorted_mask[:, 0] = False
                 mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
-                logits = logits.masked_fill(mask, dtype_min)
+                logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
 
             # Sample or greedy
             if temperature <= 0:
@@ -525,7 +539,7 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
                 next_token = torch.multinomial(probs, num_samples=1)
 
             # Mask finished sequences (keep generating pad for uniformity)
-            next_token = next_token.masked_fill(~unfinished.unsqueeze(-1), pad_token_id or 0)
+            next_token = next_token.masked_fill(~unfinished.unsqueeze(-1), pad_token_id if pad_token_id is not None else 0)
 
             generated = torch.cat([generated, next_token], dim=-1)
 
@@ -569,9 +583,15 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
 
         # Token-level log probabilities
         log_probs = F.log_softmax(shift_logits, dim=-1)  # (batch, seqlen-1, vocab)
+        # Safe gather: replace -100 (ignore_index) with 0 for index lookup,
+        # then zero out those positions in the result to avoid token-0 leakage
+        safe_indices = shift_input_ids.clamp(min=0)
         token_log_probs = log_probs.gather(
-            dim=-1, index=shift_input_ids.unsqueeze(-1).clamp(min=0)
+            dim=-1, index=safe_indices.unsqueeze(-1)
         ).squeeze(-1)  # (batch, seqlen-1)
+        # Zero out ignored positions (shift_input_ids == -100)
+        ignore_mask = (shift_input_ids == -100)
+        token_log_probs = token_log_probs.masked_fill(ignore_mask, 0.0)
 
         if labels is not None:
             # Mask: only consider response tokens

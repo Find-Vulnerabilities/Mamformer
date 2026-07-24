@@ -110,6 +110,9 @@ class MamformerBlock(nn.Module):
         dropout: float = 0.0,
         rms_norm_eps: float = 1e-6,
         sliding_window: int = 0,
+        # Attention control
+        has_attention: bool = True,
+        layer_idx: int = 0,
         # DSA
         use_dsa: bool = False,
         dsa_lambda_init: float = 0.8,
@@ -156,11 +159,13 @@ class MamformerBlock(nn.Module):
 
         self.d_model = d_model
         self.sliding_window = sliding_window
-        self.use_dsa = use_dsa
-        self.use_kda_diff = use_kda_diff
+        self.has_attention = has_attention
+        self.layer_idx = layer_idx
+        self.use_dsa = use_dsa and has_attention
+        self.use_kda_diff = use_kda_diff and has_attention
         self.use_moe = use_moe
         self.use_st_moe = use_st_moe
-        self.use_dynamic_gate = use_dynamic_gate
+        self.use_dynamic_gate = use_dynamic_gate and has_attention
 
         # Common RoPE config for attention modules
         rope_kwargs = dict(
@@ -171,50 +176,54 @@ class MamformerBlock(nn.Module):
             yarn_original_max_seq_len=rope_yarn_original_max_seq_len,
         )
 
-        # Pre-attention normalization
+        # Pre-attention normalization (always needed — SSM also uses it)
         self.input_norm = RMSNorm(d_model, eps=rms_norm_eps)
 
-        # Attention pathway: GQA, DSA, or KDA-Diff
-        if use_kda_diff:
-            self.attention = KDADiffAttention(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                head_dim=head_dim,
-                linear_ratio=kda_linear_ratio,
-                kernel_dim=kda_kernel_dim,
-                latent_dim=kda_latent_dim,
-                lambda_init=dsa_lambda_init,
-                use_state_injection=dsa_state_injection,
-                state_injection_dim=64,
-                use_dynamic_ratio=kda_use_dynamic_ratio,
-                d_state=d_state,
-                dropout=dropout,
-                sliding_window=sliding_window,
-                **rope_kwargs,
-            )
-        elif use_dsa:
-            self.attention = DifferentialStateAttention(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                head_dim=head_dim,
-                lambda_init=dsa_lambda_init,
-                use_state_injection=dsa_state_injection,
-                dropout=dropout,
-                sliding_window=sliding_window,
-                **rope_kwargs,
-            )
+        # Attention pathway: GQA, DSA, or KDA-Diff (skip if SSM-only layer)
+        if has_attention:
+            if use_kda_diff:
+                self.attention = KDADiffAttention(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    linear_ratio=kda_linear_ratio,
+                    kernel_dim=kda_kernel_dim,
+                    latent_dim=kda_latent_dim,
+                    lambda_init=dsa_lambda_init,
+                    use_state_injection=dsa_state_injection,
+                    state_injection_dim=64,
+                    use_dynamic_ratio=kda_use_dynamic_ratio,
+                    d_state=d_state,
+                    dropout=dropout,
+                    sliding_window=sliding_window,
+                    **rope_kwargs,
+                )
+                self.attention.set_layer_idx(layer_idx)
+            elif use_dsa:
+                self.attention = DifferentialStateAttention(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    lambda_init=dsa_lambda_init,
+                    use_state_injection=dsa_state_injection,
+                    dropout=dropout,
+                    sliding_window=sliding_window,
+                    **rope_kwargs,
+                )
+            else:
+                self.attention = GroupedQueryAttention(
+                    d_model=d_model,
+                    n_heads=n_heads,
+                    n_kv_heads=n_kv_heads,
+                    head_dim=head_dim,
+                    dropout=dropout,
+                    sliding_window=sliding_window,
+                    **rope_kwargs,
+                )
         else:
-            self.attention = GroupedQueryAttention(
-                d_model=d_model,
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                head_dim=head_dim,
-                dropout=dropout,
-                sliding_window=sliding_window,
-                **rope_kwargs,
-            )
+            self.attention = None
 
         # SSM pathway
         self.ssm = Mamba2Block(
@@ -224,14 +233,18 @@ class MamformerBlock(nn.Module):
             expand=mamba_expand,
         )
 
-        # Learnable per-dimension gate
+        # Learnable per-dimension gate (only for hybrid layers)
         # Initialized to 0 → sigmoid(0) = 0.5 → equal weight to both pathways
         # When use_dynamic_gate=True, replaced by a context-dependent MLP gate
-        if use_dynamic_gate:
-            self.gate_alpha = None
-            self.dynamic_gate = DynamicGate(d_model=d_model, bottleneck=dynamic_gate_bottleneck)
+        if has_attention:
+            if use_dynamic_gate:
+                self.gate_alpha = None
+                self.dynamic_gate = DynamicGate(d_model=d_model, bottleneck=dynamic_gate_bottleneck)
+            else:
+                self.gate_alpha = nn.Parameter(torch.zeros(d_model))
+                self.dynamic_gate = None
         else:
-            self.gate_alpha = nn.Parameter(torch.zeros(d_model))
+            self.gate_alpha = None
             self.dynamic_gate = None
 
         # Post-fusion normalization
@@ -301,6 +314,13 @@ class MamformerBlock(nn.Module):
         """
         Forward pass for a single Mamformer block.
 
+        Hybrid layers (has_attention=True):
+            Input → Norm → [Attention ∥ SSM] → Gate → +residual → Norm → FFN → +residual
+
+        SSM-only layers (has_attention=False):
+            Input → Norm → SSM → +residual → Norm → FFN → +residual
+            (No attention, no gate — saves ~40-50% FLOPs)
+
         Args:
             hidden_states: (batch, seqlen, d_model)
             attention_mask: Optional attention mask
@@ -315,12 +335,10 @@ class MamformerBlock(nn.Module):
         residual = hidden_states
         hidden_states = self.input_norm(hidden_states)
 
-        # Parallel pathways
-        attn_cache = cache.get("attn") if cache is not None else None
         ssm_cache = cache.get("ssm") if cache is not None else None
 
-        # SSM runs first so DSA/KDA-Diff can access its state for cross-pollination
-        # ST-MoE needs per-timestep h-state summaries for temporal routing
+        # SSM runs first so downstream consumers (DSA/ST-MoE)
+        # can access its state for cross-pollination
         ssm_h_states = None
         need_h_states = self.use_st_moe or self.use_dsa or self.use_kda_diff
         if need_h_states:
@@ -338,7 +356,38 @@ class MamformerBlock(nn.Module):
                 cache=ssm_cache,
             )
 
-        # DSA/KDA-Diff receives per-timestep SSM state summaries for cross-pollination
+        # ── SSM-only path: no attention, no gate ──────────────────
+        if not self.has_attention:
+            hidden_states = residual + ssm_out
+
+            # FFN (MoE or dense)
+            residual = hidden_states
+            hidden_states = self.post_norm(hidden_states)
+
+            moe_aux_info = None
+            if self.use_st_moe:
+                ffn_out, moe_aux_info = self.ffn(
+                    hidden_states, ssm_h_states=ssm_h_states
+                )
+            elif self.use_moe:
+                ffn_out, moe_aux_info = self.ffn(hidden_states)
+            else:
+                ffn_out = self.ffn(hidden_states)
+
+            hidden_states = residual + ffn_out
+
+            new_cache = None
+            if use_cache:
+                new_cache = {"ssm": ssm_new_cache}
+                if moe_aux_info is not None:
+                    new_cache["moe_aux_info"] = moe_aux_info
+
+            return hidden_states, new_cache
+
+        # ── Hybrid path: attention + SSM with gated fusion ────────
+        attn_cache = cache.get("attn") if cache is not None else None
+
+        # DSA/KDA-Diff receives per-timestep SSM state summaries
         ssm_kwargs = {}
         if (self.use_dsa or self.use_kda_diff) and ssm_h_states is not None:
             ssm_kwargs = {"h_states": ssm_h_states}
@@ -389,7 +438,7 @@ class MamformerBlock(nn.Module):
 
         return hidden_states, new_cache
 
-    def get_gate_values(self) -> torch.Tensor:
+    def get_gate_values(self) -> Optional[torch.Tensor]:
         """
         Return the current gate values (after sigmoid) for analysis.
 
@@ -398,8 +447,11 @@ class MamformerBlock(nn.Module):
         Values near 0.5 = balanced
 
         Returns:
-            Tensor of shape (d_model,) with values in [0, 1]
+            Tensor of shape (d_model,) with values in [0, 1],
+            or None if this is an SSM-only block.
         """
+        if self.gate_alpha is None:
+            return None
         return torch.sigmoid(self.gate_alpha).detach()
 
     def get_moe_load_statistics(self) -> Optional[dict]:
@@ -409,6 +461,15 @@ class MamformerBlock(nn.Module):
         return None
 
     def extra_repr(self) -> str:
+        if not self.has_attention:
+            ffn_type = "ST-MoE" if self.use_st_moe else ("MoE" if self.use_moe else "SwiGLU")
+            return (
+                f"d_model={self.d_model}, "
+                f"mode=SSM-only, ffn={ffn_type}, "
+                f"d_state={self.ssm.d_state}, "
+                f"d_conv={self.ssm.d_conv}"
+            )
+
         attn_type = "KDA-Diff" if self.use_kda_diff else ("DSA" if self.use_dsa else "GQA")
         if self.use_st_moe:
             ffn_type = "ST-MoE"

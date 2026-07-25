@@ -25,14 +25,13 @@ import torch.nn.functional as F
 
 
 @dataclass
-class GenerationConfig:
+class RuntimeGenerationConfig:
     """Runtime configuration for text generation.
 
     NOTE: This class controls runtime sampling parameters (temperature, top_k, etc.).
     For model-level context/output limits, see mamformer.config.GenerationConfig.
-    The two classes have the same name but serve different purposes:
       - config.py::GenerationConfig = model tier defaults (max_context, max_output)
-      - generation.py::GenerationConfig = runtime sampling params (temperature, beams)
+      - generation.py::RuntimeGenerationConfig = runtime sampling params (temperature, beams)
     """
 
     # Decoding strategy
@@ -53,6 +52,9 @@ class GenerationConfig:
     eos_token_id: Optional[int] = None
     pad_token_id: Optional[int] = None
     stop_strings: List[str] = field(default_factory=list)
+
+    # Thinking mode
+    thinking_enabled: bool = False  # Enable thinking mode for this generation call
 
     # Output
     return_full_text: bool = True
@@ -90,7 +92,7 @@ class GenerationMixin:
     def generate_ids(
         self,
         input_ids: torch.Tensor,
-        generation_config: Optional[GenerationConfig] = None,
+        generation_config: Optional[RuntimeGenerationConfig] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -98,16 +100,16 @@ class GenerationMixin:
 
         Args:
             input_ids: (batch, seqlen) prompt token IDs
-            generation_config: GenerationConfig or keyword overrides
+            generation_config: RuntimeGenerationConfig or keyword overrides
 
-        Keyword args override GenerationConfig fields:
+        Keyword args override RuntimeGenerationConfig fields:
             max_new_tokens, temperature, top_k, top_p, etc.
 
         Returns:
             Generated token IDs (batch, prompt_len + new_tokens)
         """
         if generation_config is None:
-            generation_config = GenerationConfig()
+            generation_config = RuntimeGenerationConfig()
 
         # Override with kwargs
         for key, value in kwargs.items():
@@ -124,7 +126,7 @@ class GenerationMixin:
     def _sample_loop(
         self,
         input_ids: torch.Tensor,
-        config: GenerationConfig,
+        config: RuntimeGenerationConfig,
     ) -> torch.Tensor:
         """
         Autoregressive sampling loop with caching.
@@ -185,59 +187,25 @@ class GenerationMixin:
     def _sample_token(
         self,
         logits: torch.Tensor,
-        config: GenerationConfig,
+        config: RuntimeGenerationConfig,
     ) -> torch.Tensor:
         """
         Sample a single token from logits.
 
         Args:
             logits: (batch, vocab_size) raw logits
-            config: GenerationConfig
+            config: RuntimeGenerationConfig
 
         Returns:
             (batch, 1) token indices
         """
-        vocab_size = logits.shape[-1]
-
-        if config.temperature == 0:
-            # Greedy decoding
-            return logits.argmax(dim=-1, keepdim=True)
-
-        # Temperature scaling
-        logits = logits / config.temperature
-
-        # Top-k filtering
-        if config.top_k > 0:
-            k = min(config.top_k, vocab_size)
-            top_k_values, _ = torch.topk(logits, k, dim=-1)
-            min_top_k = top_k_values[:, -1].unsqueeze(-1)
-            logits = logits.masked_fill(logits < min_top_k, float("-inf"))
-
-        # Top-p (nucleus) filtering
-        if config.top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(
-                F.softmax(sorted_logits, dim=-1), dim=-1
-            )
-            # Shift: keep first token that exceeds threshold
-            sorted_mask = cumulative_probs > config.top_p
-            sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
-            sorted_mask[:, 0] = False
-            # Scatter back
-            mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
-            logits = logits.masked_fill(mask, float("-inf"))
-
-        # Convert to probabilities
-        probs = F.softmax(logits, dim=-1)
-
-        # Handle all-zero rows (can happen with aggressive filtering)
-        probs = torch.where(
-            probs.sum(dim=-1, keepdim=True) > 0,
-            probs,
-            torch.ones_like(probs) / vocab_size,
+        from mamformer.sampling import sample_one_token
+        return sample_one_token(
+            logits,
+            temperature=config.temperature,
+            top_k=config.top_k,
+            top_p=config.top_p,
         )
-
-        return torch.multinomial(probs, num_samples=1)
 
     def _apply_repetition_penalty(
         self,
@@ -256,24 +224,13 @@ class GenerationMixin:
         Returns:
             Modified logits
         """
-        if penalty == 1.0:
-            return logits
-
-        # Get unique tokens per batch item
-        for i in range(logits.shape[0]):
-            unique_ids = set(generated_ids[i].tolist())
-            for token_id in unique_ids:
-                if logits[i, token_id] > 0:
-                    logits[i, token_id] /= penalty
-                else:
-                    logits[i, token_id] *= penalty
-
-        return logits
+        from mamformer.sampling import apply_repetition_penalty
+        return apply_repetition_penalty(logits, generated_ids, penalty)
 
     def _beam_search(
         self,
         input_ids: torch.Tensor,
-        config: GenerationConfig,
+        config: RuntimeGenerationConfig,
     ) -> torch.Tensor:
         """
         Basic beam search decoding.
@@ -408,7 +365,7 @@ class GenerationMixin:
     def generate_stream(
         self,
         input_ids: torch.Tensor,
-        generation_config: Optional[GenerationConfig] = None,
+        generation_config: Optional[RuntimeGenerationConfig] = None,
         **kwargs,
     ) -> Generator[int, None, torch.Tensor]:
         """
@@ -421,7 +378,7 @@ class GenerationMixin:
             Individual token IDs (int)
         """
         if generation_config is None:
-            generation_config = GenerationConfig()
+            generation_config = RuntimeGenerationConfig()
 
         for key, value in kwargs.items():
             if hasattr(generation_config, key):

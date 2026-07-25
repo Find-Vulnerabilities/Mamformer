@@ -203,43 +203,49 @@ def expert_dispatch(
     device = x.device
 
     if ep_group.ep_size == 1:
-        return x, torch.arange(total_tokens, device=device), torch.tensor([total_tokens], device=device)
+        return (x, torch.arange(total_tokens, device=device),
+                torch.tensor([total_tokens], device=device),
+                torch.tensor([total_tokens], device=device))
 
-    # 1. Determine which tokens go to which rank
-    token_to_rank = torch.zeros(total_tokens, dtype=torch.long, device=device)
-    for expert_idx in range(n_experts):
-        mask = (expert_indices == expert_idx)
-        target_rank = ep_group.get_expert_rank(expert_idx, n_experts)
-        token_to_rank[mask] = target_rank
+    # 1. Build expert-index → rank lookup table (O(n_experts), once)
+    experts_per_rank = (n_experts + ep_group.ep_size - 1) // ep_group.ep_size
+    expert_to_rank = torch.div(
+        torch.arange(n_experts, device=device), experts_per_rank,
+        rounding_mode='floor',
+    ).clamp(max=ep_group.ep_size - 1)
 
-    # 2. Sort tokens by target rank (for contiguous all-to-all)
-    sort_order = torch.argsort(token_to_rank)
-    sorted_x = x[sort_order]
-    sorted_ranks = token_to_rank[sort_order]
+    # 2. Map each token's expert to destination rank via lookup (O(N))
+    # expert_indices shape: (N,) → index into lookup table
+    token_to_rank = expert_to_rank[expert_indices]
 
-    # 3. Count tokens per rank (send-side)
-    token_counts = torch.zeros(ep_group.ep_size, dtype=torch.long, device=device)
-    for r in range(ep_group.ep_size):
-        token_counts[r] = (sorted_ranks == r).sum()
+    # 3. Count tokens per destination rank (vectorized bincount, O(N))
+    token_counts = torch.bincount(
+        token_to_rank, minlength=ep_group.ep_size,
+    )
 
     if token_counts.sum() == 0:
         return (torch.zeros(0, x.shape[1], device=device, dtype=x.dtype),
-                sort_order, token_counts, None)
+                torch.zeros(0, dtype=torch.long, device=device),
+                token_counts,
+                torch.zeros(ep_group.ep_size, dtype=torch.long, device=device))
 
-    # 4. Exchange token counts to build full send/receive matrix
-    # After this, recv_counts[r] = tokens rank r sent to ME (what I'll receive)
+    # 4. Sort tokens by destination rank for contiguous all-to-all chunks.
+    # Uses stable sort to preserve original order within each rank group.
+    sort_order = torch.argsort(token_to_rank, stable=True)
+    sorted_x = x[sort_order]
+    sorted_ranks = token_to_rank[sort_order]
+
+    # 5. Exchange token counts to build full send/receive matrix
     all_send_counts = [torch.zeros(ep_group.ep_size, dtype=torch.long, device=device)
                        for _ in range(ep_group.ep_size)]
     if ep_group._is_initialized and ep_group.ep_size > 1:
         dist.all_gather(all_send_counts, token_counts, group=ep_group.group)
     else:
         all_send_counts = [token_counts]
-    # count_matrix[src, dst] = tokens sent from src to dst
-    count_matrix = torch.stack(all_send_counts, dim=0)  # (ep_size, ep_size)
-    # recv_counts[r] = tokens I will receive from rank r = count_matrix[r, my_rank]
-    recv_counts = count_matrix[:, ep_group.ep_rank]  # (ep_size,)
+    count_matrix = torch.stack(all_send_counts, dim=0)
+    recv_counts = count_matrix[:, ep_group.ep_rank]
 
-    # 5. All-to-all: send sorted tokens to expert-owning ranks
+    # 6. All-to-all: send sorted tokens to expert-owning ranks
     split_sizes = token_counts.tolist()
     dispatched = ep_group.all_to_all(sorted_x, split_sizes)
 
@@ -446,6 +452,14 @@ class EPMoE(nn.Module):
             self._update_expert_bias(top_k_indices, batch_size * seq_len)
             aux_info["expert_bias_mean"] = self.expert_bias.mean().item()
 
+        # Track expert usage for monitoring (vectorized)
+        if self.training:
+            with torch.no_grad():
+                self._total_tokens += batch_size * seq_len
+                flat_indices = top_k_indices.flatten().long()
+                counts = torch.bincount(flat_indices, minlength=self.n_routed_experts_total)
+                self._expert_counts += counts
+
         return shared_out + routed_out, aux_info
 
     def _ep_routed_forward(self, x, top_k_indices, top_k_gates):
@@ -517,20 +531,39 @@ class EPMoE(nn.Module):
         return output.view(B, S, D)
 
     def _update_expert_bias(self, top_k_indices, total_tokens):
-        expert_counts = torch.zeros(self.n_routed_experts_total, device=top_k_indices.device, dtype=torch.float32)
-        for i in range(self.n_routed_experts_total):
-            expert_counts[i] = (top_k_indices == i).sum().float()
-        actual_load = expert_counts / (total_tokens * self.top_k + 1e-8)
-        expected_load = 1.0 / self.n_routed_experts_total
-        self.expert_bias -= self.bias_update_speed * torch.sign(actual_load - expected_load)
-        self.expert_load_ema = 0.99 * self.expert_load_ema + 0.01 * actual_load
+        """Vectorized aux-loss-free expert bias update (shared with DeepSeekMoE)."""
+        from mamformer.layers.moe import _moe_update_expert_bias
+        _moe_update_expert_bias(
+            top_k_indices, total_tokens, self.n_routed_experts_total, self.top_k,
+            self.bias_update_speed, self.expert_bias, self.expert_load_ema,
+        )
 
 
 from mamformer.layers.moe import _SwiGLUExpert  # noqa: E402 (import after class def)
 
 
 def shard_experts_ep(model: nn.Module, ep_group: ExpertParallelGroup) -> nn.Module:
-    """Replace MoE layers with EP-aware versions."""
-    # For constructed models: iterate and replace MoE layers
-    # This is a utility for integration with the coordinator
+    """
+    Replace MoE layers with EP-aware versions (EPMoE).
+
+    NOTE: Retroactive EP sharding is not yet fully implemented.
+    For production use, construct the model with EPMoE wrappers directly
+    at init time. This function currently returns the model unchanged
+    when ep_size==1, and warns when ep_size > 1.
+
+    Args:
+        model: MamformerForCausalLM or MamformerModel
+        ep_group: ExpertParallelGroup configuration
+
+    Returns:
+        Model (currently unchanged)
+    """
+    if ep_group.ep_size > 1:
+        import warnings
+        warnings.warn(
+            f"Retroactive EP sharding (ep_size={ep_group.ep_size}) is not yet implemented. "
+            "MoE layers will not be expert-parallelized. "
+            "Construct the model with EPMoE wrappers at init time instead.",
+            RuntimeWarning,
+        )
     return model

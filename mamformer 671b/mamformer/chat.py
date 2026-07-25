@@ -11,6 +11,27 @@ Supports:
   - Chat template formatting (Llama-style and custom)
   - Save/load conversation history
 
+─── THINKING / REFLECTION NOTE ───────────────────────────────────────
+Mamformer has THREE independent thinking/reflection mechanisms:
+
+  1. chat.py (THIS FILE): Language-level reflection via XML tags
+     - reflection_mode="think":  <thinking>...</thinking><answer>...</answer>
+     - reflection_mode="critique": <draft>...<critique>...<final>...
+     - Prompt-level only — no model architecture changes
+
+  2. model.py: Token-based multi-path parallel thinking
+     - Uses ThinkingConfig + special control tokens (IDs 3-7)
+     - N parallel reasoning paths + summary synthesis + answer
+     - Requires model embedding extension for thinking tokens
+
+  3. reflection.py: MLP-based self-reflection module
+     - ReflectionModule attached to model via add_reflection_to_model()
+     - Generates critique logits, refines hidden states, confidence score
+     - Architecture-level — adds trainable parameters to the model
+
+These three systems serve different use cases and do NOT interoperate.
+For new development, prefer model.py's thinking path (most feature-complete).
+
 Usage:
     from mamformer.chat import ChatSession
 
@@ -395,38 +416,14 @@ class ChatSession:
             logits = outputs["logits"][:, -1, :]
             cache = outputs.get("cache")
 
-            # Temperature scaling (greedy when temperature=0)
-            if self.temperature <= 0:
-                # Greedy: take argmax directly
-                next_token = logits.argmax(dim=-1, keepdim=True)
-                generated = torch.cat([generated, next_token], dim=-1)
-                token_id = next_token[0, 0].item()
-                yield token_id
-                if config.eos_token_id is not None and token_id == config.eos_token_id:
-                    break
-                continue
+            from mamformer.sampling import sample_one_token
 
-            if self.temperature != 1.0:
-                logits = logits / self.temperature
-
-            # Top-k
-            if self.top_k > 0:
-                k = min(self.top_k, logits.size(-1))
-                top_k_vals, _ = torch.topk(logits, k, dim=-1)
-                logits = logits.masked_fill(logits < top_k_vals[:, -1:], float("-inf"))
-
-            # Top-p
-            if self.top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumsum = torch.cumsum(torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_mask = cumsum > self.top_p
-                sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
-                sorted_mask[:, 0] = False
-                mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
-                logits = logits.masked_fill(mask, float("-inf"))
-
-            probs = torch.nn.functional.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+            next_token = sample_one_token(
+                logits,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                top_p=self.top_p,
+            )
             generated = torch.cat([generated, next_token], dim=-1)
 
             # Decode current token

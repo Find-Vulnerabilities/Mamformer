@@ -66,6 +66,7 @@ from mamformer.config import MamformerConfig
 from mamformer.model import MamformerForCausalLM
 from mamformer.tokenizer import MamformerTokenizer
 from mamformer.rewards import RewardCalculator
+from mamformer.sgrpo import StochasticGRPOConfig, sample_token_mask
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +397,21 @@ def train_grpo(config: dict) -> None:
     gen_top_p = config.get("gen_top_p", 0.95)
     gen_top_k = config.get("gen_top_k", 50)
 
+    # ── S-GRPO Config ─────────────────────────────────────────
+    sgrpo_cfg = StochasticGRPOConfig(
+        enabled=config.get("sgrpo", False),
+        p=config.get("sgrpo_p", 0.4),
+        alpha=config.get("sgrpo_alpha", 0),
+        k=config.get("sgrpo_k", 0),
+    )
+    if sgrpo_cfg.enabled:
+        sgrpo_cfg.validate()
+        if global_rank == 0:
+            logger.info(
+                f"Stochastic GRPO: ENABLED "
+                f"(p={sgrpo_cfg.p}, alpha={sgrpo_cfg.alpha}, k={sgrpo_cfg.k})"
+            )
+
     # ── Training State ───────────────────────────────────────
     global_step = 0
     max_steps = config.get("max_steps", 10000)
@@ -544,37 +560,50 @@ def train_grpo(config: dict) -> None:
                     flat_idx = b_idx * G + g_idx
                     labels[flat_idx, prompt_len + cur_len:] = -100
 
-        # ── Forward through policy model ─────────────────────
+        # ── Forward through policy AND reference models ──────
+        # Single sub-batch loop — policy and reference share the same
+        # S-GRPO token mask for consistent KL estimation.
         policy_log_probs_flat = torch.zeros(B * G, device=device)
+        reference_log_probs_flat = torch.zeros(B * G, device=device)
 
-        # Process in sub-batches to manage memory
         sub_batch_size = config.get("sub_batch_size") or B * G
         for start in range(0, B * G, sub_batch_size):
             end = min(start + sub_batch_size, B * G)
             sub_input = full_input_ids[start:end]
             sub_labels = labels[start:end]
 
+            # ── Generate S-GRPO token masks (shared by policy + ref) ──
+            token_mask = None
+            if sgrpo_cfg.enabled:
+                sub_bs = sub_input.shape[0]
+                resp_lens = (sub_labels != -100).sum(dim=1)
+                token_mask = torch.zeros(
+                    sub_bs, sub_labels.shape[1] - 1,
+                    dtype=torch.bool, device=device,
+                )
+                for i in range(sub_bs):
+                    rlen = resp_lens[i].item()
+                    if rlen > 0:
+                        token_mask[i, :rlen] = sample_token_mask(
+                            rlen, sgrpo_cfg, device=device,
+                        )
+
+            # Policy model forward
             with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu",
                                     dtype=amp_dtype, enabled=amp_enabled):
                 policy_log_probs_flat[start:end] = policy_model.get_log_probs(
                     input_ids=sub_input,
                     labels=sub_labels,
+                    token_mask=token_mask,
                 )
 
-        # ── Forward through reference model (no grad) ────────
-        reference_log_probs_flat = torch.zeros(B * G, device=device)
-        with torch.no_grad():
-            for start in range(0, B * G, sub_batch_size):
-                end = min(start + sub_batch_size, B * G)
-                sub_input = full_input_ids[start:end]
-                sub_labels = labels[start:end]
-
-                with torch.amp.autocast(device_type="cuda" if "cuda" in str(device) else "cpu",
-                                        dtype=amp_dtype, enabled=amp_enabled):
-                    reference_log_probs_flat[start:end] = reference_model.get_log_probs(
-                        input_ids=sub_input,
-                        labels=sub_labels,
-                    )
+            # Reference model forward (no grad, same mask = consistent KL)
+            with torch.no_grad():
+                reference_log_probs_flat[start:end] = reference_model.get_log_probs(
+                    input_ids=sub_input,
+                    labels=sub_labels,
+                    token_mask=token_mask,  # Same mask as policy
+                )
 
         # Reshape to (B, G)
         policy_log_probs = policy_log_probs_flat.view(B, G)
@@ -587,6 +616,15 @@ def train_grpo(config: dict) -> None:
             advantages=advantages,
             kl_beta=kl_beta,
         )
+
+        # ── Add S-GRPO sparsity metrics when enabled ──────────
+        if sgrpo_cfg.enabled:
+            # Average tokens used: total response tokens vs actually used
+            total_resp = (labels != -100).sum(dim=1).float().mean().item()
+            # Estimate from policy_log_probs — when token_mask is applied,
+            # avg_log_prob is computed over fewer tokens
+            metrics["sgrpo_enabled"] = True
+            metrics["sgrpo_p"] = sgrpo_cfg.p
 
         loss = loss / grad_accum
         loss.backward()
@@ -822,6 +860,16 @@ def main():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--resume", type=str, default=None, help="Resume from GRPO checkpoint")
 
+    # S-GRPO (Stochastic GRPO)
+    parser.add_argument("--sgrpo", action="store_true",
+                       help="Enable Stochastic GRPO (sparse token sampling)")
+    parser.add_argument("--sgrpo_p", type=float, default=0.4,
+                       help="Token sampling probability (default: 0.4)")
+    parser.add_argument("--sgrpo_alpha", type=int, default=0,
+                       help="First N tokens always included in loss (default: 0)")
+    parser.add_argument("--sgrpo_k", type=int, default=0,
+                       help="Max tokens for loss per response (0=disabled)")
+
     # Logging
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="Mamformer-GRPO")
@@ -868,6 +916,11 @@ def main():
         "use_wandb": args.use_wandb,
         "wandb_project": args.wandb_project,
         "wandb_run_name": args.wandb_run_name,
+        # S-GRPO
+        "sgrpo": args.sgrpo,
+        "sgrpo_p": args.sgrpo_p,
+        "sgrpo_alpha": args.sgrpo_alpha,
+        "sgrpo_k": args.sgrpo_k,
     }
 
     train_grpo(config)

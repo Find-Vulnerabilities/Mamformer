@@ -102,6 +102,7 @@ class GroupedQueryAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         cache: Optional[dict] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[dict]]:
         """
         Forward pass for GQA.
@@ -112,6 +113,7 @@ class GroupedQueryAttention(nn.Module):
                            Shape: (batch, 1, seq_len, seq_len) or None for causal
             use_cache: If True, return updated KV cache
             cache: Optional KV cache dict with 'k' and 'v' keys
+            **kwargs: Ignored extra args (e.g., h_states for cross-layer compatibility)
 
         Returns:
             (output, cache) — output shape (batch, seq_len, d_model)

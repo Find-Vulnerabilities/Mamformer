@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mamformer.config import MamformerConfig
 from mamformer.model import MamformerForCausalLM
 from mamformer.tokenizer import MamformerTokenizer
+from mamformer.thinking_data import format_batch_with_thinking
 
 logger = logging.getLogger(__name__)
 
@@ -268,12 +269,17 @@ def train(config: dict) -> None:
     )
 
     # IterableDataset duplicates data across workers without worker_init_fn.
-    # Use num_workers=0 for correctness, or set a proper worker_init_fn.
+    # Use num_workers=0 for correctness.
     n_workers = config.get("num_workers", 0)
     if n_workers > 0:
-        logger.warning(
-            f"IterableDataset with num_workers={n_workers} may duplicate data. "
-            "Set num_workers=0 for correct streaming, or implement worker_init_fn."
+        logger.error(
+            f"IterableDataset with num_workers={n_workers} WILL duplicate training data "
+            "across workers. Each worker independently iterates the same dataset. "
+            "Set --num_workers 0 for correct streaming."
+        )
+        raise RuntimeError(
+            f"num_workers={n_workers} > 0 causes data duplication with IterableDataset. "
+            "Use --num_workers 0, or replace TextDataset with a shard-per-worker dataset."
         )
     dataloader = DataLoader(
         dataset,
@@ -347,6 +353,14 @@ def train(config: dict) -> None:
         input_ids = batch["input_ids"].to(device)
         labels = batch["labels"].to(device)
 
+        # ── Thinking format: wrap training data with control tokens ──
+        if config.get("thinking_format", False):
+            # Ensure model embeddings cover thinking token IDs
+            model._ensure_thinking_tokens()
+            input_ids, labels = format_batch_with_thinking(input_ids, labels)
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+
         # ── NaN Detection (before forward) ─────────────────────
         # Check input for NaN (corrupt data)
         if torch.isnan(input_ids.float()).any() or torch.isnan(labels.float()).any():
@@ -382,7 +396,14 @@ def train(config: dict) -> None:
             if nan_count >= 3:
                 logger.critical("3 consecutive NaN steps — auto-resuming from last checkpoint!")
                 # Try to recover from last good checkpoint
-                last_ckpt = sorted(output_dir.glob("checkpoint_step_*.pt"))
+                # Sort by step number (not lexicographically) to get the latest
+                def _ckpt_step(path):
+                    try:
+                        return int(path.stem.split("_")[-1])
+                    except (ValueError, IndexError):
+                        return 0
+                ckpts = sorted(output_dir.glob("checkpoint_step_*.pt"), key=_ckpt_step)
+                last_ckpt = ckpts
                 if last_ckpt:
                     checkpoint = torch.load(str(last_ckpt[-1]), map_location=device)
                     model.load_state_dict(checkpoint["model"], strict=False)
@@ -566,9 +587,12 @@ def main():
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="Mamformer")
     parser.add_argument("--wandb_run_name", type=str, default=None)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=0,
+                       help="DataLoader workers (0 = no duplication with IterableDataset)")
     parser.add_argument("--resume", type=str, default=None, help="Resume from checkpoint")
     parser.add_argument("--comm_moe", action="store_true", help="Enable CommunicativeMoE cross-expert communication")
+    parser.add_argument("--thinking_format", action="store_true",
+                       help="Wrap training data with thinking control tokens for SFT")
 
     args = parser.parse_args()
 
@@ -601,6 +625,7 @@ def main():
         "num_workers": args.num_workers,
         "resume": args.resume,
         "comm_moe": args.comm_moe,
+        "thinking_format": args.thinking_format,
     }
 
     train(config)

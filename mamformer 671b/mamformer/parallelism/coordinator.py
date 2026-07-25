@@ -77,21 +77,30 @@ class ParallelConfig:
         total_gpus = self.world_size
         if torch.distributed.is_initialized():
             actual_gpus = torch.distributed.get_world_size()
-            assert total_gpus == actual_gpus, (
-                f"ParallelConfig world_size ({total_gpus}) != actual GPUs ({actual_gpus})"
-            )
+            if total_gpus != actual_gpus:
+                raise ValueError(
+                    f"ParallelConfig world_size ({total_gpus}) does not match "
+                    f"actual GPU count ({actual_gpus}). DP={self.dp_size} * "
+                    f"TP={self.tp_size} * PP={self.pp_size} * EP={self.ep_size}."
+                )
 
-        # TP size must divide model dimensions
-        # (checked at model construction time, but warn here)
+        # TP size: validate common-sense constraints
         if self.tp_size > 1:
-            pass  # n_heads, n_kv_heads, d_model divisibility checked at layer init
+            if self.tp_size & (self.tp_size - 1) != 0:
+                raise ValueError(
+                    f"tp_size ({self.tp_size}) must be a power of 2 "
+                    f"(2, 4, 8) for efficient all-reduce."
+                )
 
-        # EP must have at least as many experts as ep_size
-        # (checked at MoE layer construction)
+        # EP size: must not exceed typical expert counts
+        if self.ep_size > 1:
+            if self.ep_size > 64:
+                raise ValueError(
+                    f"ep_size ({self.ep_size}) > 64 is likely too high. "
+                    "Each EP rank needs at least a few experts."
+                )
 
-        # PP should divide layers evenly
-        if self.pp_size > 1:
-            pass  # Checked at shard_model_pp time
+        # PP: validated at shard_model_pp time (layer count divisibility)
 
     def get_4d_rank(self, global_rank: int) -> tuple:
         """
@@ -162,33 +171,76 @@ class DistributedCoordinator:
         dp_rank, tp_rank, pp_rank, ep_rank = self.config.get_4d_rank(global_rank)
 
         self._ranks = {"dp": dp_rank, "tp": tp_rank, "pp": pp_rank, "ep": ep_rank}
-        # Map dimension names to tuple indices for get_4d_rank
+
+        # Build process groups: compute membership directly from 4D
+        # coordinates instead of scanning all ranks per dimension.
+        # TP group: ranks that share the same (dp, pp, ep) coordinates.
         _dim_idx = {"dp": 0, "tp": 1, "pp": 2, "ep": 3}
 
-        # Build process groups: group GPUs that share the same 3 coordinates
-        # TP group: same DP, PP, EP — different TP
-        for dim, fixed_dims in [
-            ("tp", ["dp", "pp", "ep"]),
-            ("pp", ["dp", "tp", "ep"]),
-            ("ep", ["dp", "tp", "pp"]),
-            ("dp", ["tp", "pp", "ep"]),
-        ]:
-            group_ranks = []
-            for r in range(self.config.world_size):
-                r_coords = self.config.get_4d_rank(r)
-                same = all(
-                    r_coords[_dim_idx[d]] == self._ranks[d]
-                    for d in fixed_dims
-                )
-                if same:
-                    group_ranks.append(r)
+        # Pre-compute the set of ranks for each group via coordinate walk.
+        # Each dimension's group = all values of that dim while others are fixed.
+        dim_sizes = {"dp": self.config.dp_size, "tp": self.config.tp_size,
+                     "pp": self.config.pp_size, "ep": self.config.ep_size}
 
-            if len(group_ranks) > 1:
-                self._groups[dim] = dist.new_group(group_ranks)
-            else:
+        for dim, fixed_dims in [
+            ("tp", ("dp", "pp", "ep")),
+            ("pp", ("dp", "tp", "ep")),
+            ("ep", ("dp", "tp", "pp")),
+            ("dp", ("tp", "pp", "ep")),
+        ]:
+            if dim_sizes[dim] <= 1:
                 self._groups[dim] = None
+                continue
+
+            # Walk all values of `dim` while keeping fixed dims at our rank
+            group_ranks = []
+            for v in range(dim_sizes[dim]):
+                coords = {d: self._ranks[d] for d in fixed_dims}
+                coords[dim] = v
+                r = self.config.get_global_rank(
+                    dp=coords.get("dp", self._ranks["dp"]),
+                    tp=coords.get("tp", self._ranks["tp"]),
+                    pp=coords.get("pp", self._ranks["pp"]),
+                    ep=coords.get("ep", self._ranks["ep"]),
+                )
+                group_ranks.append(r)
+
+            self._groups[dim] = dist.new_group(group_ranks)
+
+            # Validate group size matches expected parallelism degree
+            actual_size = dist.get_world_size(self._groups[dim])
+            expected = dim_sizes[dim]
+            if actual_size != expected:
+                raise RuntimeError(
+                    f"Process group '{dim}' has {actual_size} members, "
+                    f"expected {expected}. Group ranks: {group_ranks}. "
+                    f"Check your 4D coordinate mapping — this indicates "
+                    f"a bug in get_4d_rank or get_global_rank."
+                )
+
+        # ── Self-consistency check: verify our rank is in every group ──
+        for dim in ["tp", "pp", "ep", "dp"]:
+            grp = self._groups.get(dim)
+            if grp is not None:
+                my_local_rank = dist.get_rank(grp)
+                if my_local_rank != self._ranks[dim]:
+                    raise RuntimeError(
+                        f"Rank mismatch in '{dim}' group: local_rank={my_local_rank} "
+                        f"but expected {self._ranks[dim]}. "
+                        f"4D topology may be incorrectly configured."
+                    )
 
         self._setup_tp_group()
+
+        # ── Print topology for debugging ──────────────────────────
+        if global_rank == 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(
+                f"4D topology: world={self.config.world_size} "
+                f"DP={self.config.dp_size} TP={self.config.tp_size} "
+                f"PP={self.config.pp_size} EP={self.config.ep_size}"
+            )
 
     def _setup_tp_group(self):
         """Configure TP group in the tensor_parallel module."""

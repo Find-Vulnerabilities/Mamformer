@@ -199,16 +199,37 @@ else:
         )
 
 
-# ── Fused Triton Kernel (Production) ────────────────────────────────────
+# ── Fused Triton Kernel (EXPERIMENTAL — DISABLED) ───────────────────────
 #
-# triton_selective_scan_fused: Applies dt/B/C projections + SSD scan in
-# one kernel, eliminating intermediate global memory writes for the
-# projected dt, B, C tensors. This reduces memory bandwidth by ~30-40%
-# compared to staged projection-then-scan.
+# WARNING: triton_selective_scan_fused is DISABLED by default due to a
+# known correctness bug. DO NOT RE-ENABLE without fixing the issue below.
 #
-# The fused kernel handles the dt_proj (2-layer MLP: d_inner → dt_rank → d_inner)
-# and B/C projections (Linear: d_inner → d_state) in-register, then runs
-# the SSD scan without writing intermediates to global memory.
+# BUG DESCRIPTION:
+#   The fused kernel partitions d_inner into BLOCK_D-sized chunks, with
+#   one Triton block per (batch, d_inner_chunk). Each block computes dt,
+#   B, C projections from ONLY its local chunk of the input x — e.g.,
+#   dt_hidden = x[s, chunk] @ W1[chunk, :]  (PARTIAL dot product).
+#
+#   Linear projections require the FULL dot product across ALL d_inner
+#   dimensions: x[s, :] @ W. Since the kernel has NO cross-block reduction
+#   step (no atomic add, no all-reduce, no separate aggregation pass),
+#   EVERY block produces WRONG projection results. Consequently the SSD
+#   scan and all outputs are invalid.
+#
+#   When d_inner=4096 and BLOCK_D=64, there are 64 chunks and ALL are wrong.
+#
+# FIX REQUIRED (choose one):
+#   (a) Add a cross-block reduction step (atomic add across d_inner chunks)
+#   (b) Process all d_inner in a single block (not scalable)
+#   (c) Use a two-kernel approach: projection kernel → reduction kernel → scan
+#
+# Until fixed, Mamformer's Mamba2Block always uses the CORRECT staged path:
+#   1. Project dt, B, C via standard nn.Linear (full d_inner)
+#   2. Run selective_scan with pre-projected tensors
+#   This path is validated against the PyTorch reference implementation.
+#
+# The original intent was to eliminate intermediate global memory writes
+# (~30-40% bandwidth reduction), but correctness must come first.
 
 if is_triton_available():
     import triton

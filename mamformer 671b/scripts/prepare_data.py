@@ -119,6 +119,16 @@ def tokenize_and_save(
         total_tokens += len(ids)
         buffer.extend(ids)
 
+        # Track open file handles per shard to avoid appending to stale files
+        # when shard_idx wraps around (numpy .tofile(path) always appends).
+        shard_handles: dict[int, object] = {}
+
+        def _get_shard_handle(idx: int):
+            if idx not in shard_handles:
+                path = output_dir / f"train_{idx:04d}.bin"
+                shard_handles[idx] = open(path, "wb")
+            return shard_handles[idx]
+
         # When buffer has enough tokens, flush chunks
         while len(buffer) >= seq_len + 1:
             chunk = buffer[: seq_len + 1]
@@ -126,34 +136,33 @@ def tokenize_and_save(
 
             # Write as uint16 (max vocab 65536) or uint32 for larger vocab
             arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)
-            arr.tofile(current_shard_path)
+            arr.tofile(_get_shard_handle(shard_idx))
 
             shard_size += 1
 
             # Rotate shards
             if shard_size >= 10000:  # ~10K chunks per shard
                 shard_idx = (shard_idx + 1) % num_shards
-                current_shard_path = output_dir / f"train_{shard_idx:04d}.bin"
                 shard_size = 0
 
         if total_docs % 10000 == 0:
             print(f"  Processed {total_docs:,} docs, {total_tokens:,} tokens")
 
-    # Flush remaining tokens (condition len(buffer) >= seq_len + 1 is always
-    # False after the while loop, so this was dead code; write partial chunk
-    # as the last chunk if buffer has any tokens)
+    # Flush remaining tokens
     if len(buffer) > 0:
-        # After the while loop, len(buffer) < seq_len + 1 is guaranteed.
-        # Only write the remainder if it contains meaningful data.
-        if len(buffer) > 0:
-            # Pad the final incomplete chunk with zeros (will be masked by labels)
-            chunk = list(buffer) + [0] * (seq_len + 1 - len(buffer))
+        # Pad the final incomplete chunk with zeros (will be masked by labels)
+        chunk = list(buffer) + [0] * (seq_len + 1 - len(buffer))
         arr = np.array(chunk, dtype=np.uint16 if tokenizer.vocab_size < 65536 else np.uint32)
-        arr.tofile(current_shard_path)
+        arr.tofile(_get_shard_handle(shard_idx))
         shard_size += 1
 
+    # Close all shard file handles
+    for h in shard_handles.values():
+        h.close()
+
     print(f"\nDone! {total_docs:,} documents -> {total_tokens:,} tokens")
-    print(f"Saved {shard_idx + 1} shards to {output_dir}/")
+    # num_shards = number of unique shard files created
+    print(f"Saved {len(shard_handles)} shards to {output_dir}/")
 
     # Write metadata JSON so readers know the dtype and sequence length
     dtype_str = "uint16" if tokenizer.vocab_size < 65536 else "uint32"
@@ -162,7 +171,7 @@ def tokenize_and_save(
         "seq_len": seq_len,
         "total_tokens": total_tokens,
         "vocab_size": tokenizer.vocab_size,
-        "num_shards": shard_idx + 1,
+        "num_shards": len(shard_handles),
     }
     meta_path = output_dir / "metadata.json"
     with open(meta_path, "w") as f:

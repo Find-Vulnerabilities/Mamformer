@@ -37,7 +37,17 @@ from collections import deque
 
 
 class _SendForward(torch.autograd.Function):
-    """Autograd function for pipeline forward send. In backward, receives gradients."""
+    """
+    Send activations to the next pipeline stage (forward pass pass-through).
+
+    On the sender: returns tensor unchanged (pass-through) after sending a
+    contiguous copy to the destination rank. The sender's computation graph
+    retains the original tensor — only detach if the sender won't need it.
+
+    On the receiver: _RecvForward provides the received tensor.
+
+    Backward: receives gradients from the destination rank.
+    """
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, dst: int, group) -> torch.Tensor:
@@ -84,6 +94,13 @@ class _RecvForward(torch.autograd.Function):
 # ═══════════════════════════════════════════════════════════════════════
 # Pipeline Stage
 # ═══════════════════════════════════════════════════════════════════════
+
+def _layer_forward(layer: nn.Module, hidden_states: torch.Tensor,
+                   attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Single-layer forward for gradient checkpointing (returns only hidden_states)."""
+    out, _ = layer(hidden_states, attention_mask=attention_mask, use_cache=False, cache=None)
+    return out
+
 
 class PipelineStage(nn.Module):
     """
@@ -155,16 +172,24 @@ class PipelineStage(nn.Module):
             attention_mask = attention_mask[:, None, None, :].to(dtype=hidden_states.dtype)
             attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
 
-        # Run layers
+        # Run layers (with optional gradient checkpointing)
         cache_list = [] if use_cache else None
         for layer in self.layers:
-            hidden_states, layer_cache = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                use_cache=use_cache,
-                cache=None,
-            )
-            if use_cache:
+            if self.gradient_checkpointing and self.training:
+                hidden_states = torch.utils.checkpoint.checkpoint(
+                    _layer_forward,
+                    layer, hidden_states, attention_mask,
+                    use_reentrant=False,
+                )
+                layer_cache = None
+            else:
+                hidden_states, layer_cache = layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    use_cache=use_cache,
+                    cache=None,
+                )
+            if use_cache and layer_cache is not None:
                 cache_list.append(layer_cache)
 
         # Last stage: final norm
@@ -251,6 +276,18 @@ class PipelineScheduler1F1B:
         self.pp_group = pp_group
         self.rank = dist.get_rank(pp_group) if pp_group and dist.is_initialized() else 0
         self.stage = stages[self.rank]
+
+        # Validate: num_microbatches must be at least pp_size.
+        # With fewer microbatches than pipeline stages, the warmup phase
+        # cannot complete — later stages would never receive their first
+        # forward, starving the pipeline.
+        if self.pp_size > 1 and num_microbatches < self.pp_size:
+            raise ValueError(
+                f"num_microbatches ({num_microbatches}) must be >= "
+                f"pp_size ({self.pp_size}) for 1F1B schedule. "
+                f"With fewer microbatches, later pipeline stages starve. "
+                f"Recommend: num_microbatches >= 2 * pp_size for efficiency."
+            )
 
     def run_forward_backward(
         self,

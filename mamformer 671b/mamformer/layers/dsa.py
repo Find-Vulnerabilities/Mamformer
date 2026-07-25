@@ -338,15 +338,21 @@ class DifferentialStateAttention(nn.Module):
         """
         Project per-timestep SSM h-states to K/V injection values.
 
+        NOTE: h_states are padded/truncated to state_injection_dim before
+        projection. When d_state > state_injection_dim, information from
+        higher SSM state dimensions is discarded. This is intentional as a
+        bottleneck — the injection is meant to be a lightweight signal,
+        not a full state reconstruction.
+
         h_states: (batch, seqlen, d_state) — SSM state summaries per position
         Returns: (batch, seqlen, n_kv_heads * head_dim) — additive injection
         """
         batch, seqlen, d_state = h_states.shape
-        # h_states has d_state dims; pad/trim to state_injection_dim for projection
+        # Pad/trim h_states to state_injection_dim for the bottleneck projection
         flat = h_states.reshape(batch * seqlen, d_state)
         target_dim = self.state_injection_dim
         if d_state < target_dim:
-            flat = torch.nn.functional.pad(flat, (0, target_dim - d_state))
+            flat = F.pad(flat, (0, target_dim - d_state))
         elif d_state > target_dim:
             flat = flat[:, :target_dim]
         # Project to K/V space

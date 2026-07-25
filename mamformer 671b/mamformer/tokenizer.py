@@ -21,12 +21,35 @@ class MamformerTokenizer:
     HuggingFace PreTrainedTokenizer. For testing, provides a simple
     character-level tokenizer fallback.
 
+    Thinking tokens (for toggleable reasoning mode):
+        <|think_start|>  — marks the beginning of internal reasoning
+        <|think_end|>    — marks the end of internal reasoning
+        <|answer_start|> — marks the beginning of the final answer
+        <|answer_end|>   — marks the end of the final answer
+
     Args:
         tokenizer: A HuggingFace PreTrainedTokenizer instance, or None for fallback
         bos_token: Beginning-of-sequence token string
         eos_token: End-of-sequence token string
         pad_token: Padding token string
     """
+
+    # ── Thinking token ID constants ─────────────────────────────────
+    THINK_START_ID: int = 3
+    THINK_END_ID: int = 4
+    ANSWER_START_ID: int = 5
+    ANSWER_END_ID: int = 6
+    SUMMARY_START_ID: int = 7
+
+    THINKING_TOKEN_IDS: set[int] = {3, 4, 5, 6, 7}
+
+    THINKING_TOKEN_NAMES: dict[int, str] = {
+        3: "<|think_start|>",
+        4: "<|think_end|>",
+        5: "<|answer_start|>",
+        6: "<|answer_end|>",
+        7: "<|summary_start|>",
+    }
 
     def __init__(
         self,
@@ -37,12 +60,19 @@ class MamformerTokenizer:
     ) -> None:
         self._tokenizer = tokenizer
 
+        # ── Thinking token IDs ──────────────────────────────────
+        self.think_start_token_id: int = MamformerTokenizer.THINK_START_ID
+        self.think_end_token_id: int = MamformerTokenizer.THINK_END_ID
+        self.answer_start_token_id: int = MamformerTokenizer.ANSWER_START_ID
+        self.answer_end_token_id: int = MamformerTokenizer.ANSWER_END_ID
+        self.summary_start_token_id: int = MamformerTokenizer.SUMMARY_START_ID
+
         if tokenizer is not None:
             # Use HuggingFace tokenizer
             self.bos_token_id = tokenizer.bos_token_id or 0
             self.eos_token_id = tokenizer.eos_token_id or 1
             self.pad_token_id = tokenizer.pad_token_id or 0
-            self.vocab_size = tokenizer.vocab_size
+            self.vocab_size = max(tokenizer.vocab_size, self.answer_end_token_id + 1)
             self._encode = self._encode_hf
             self._decode = self._decode_hf
         else:
@@ -50,7 +80,7 @@ class MamformerTokenizer:
             self.bos_token_id = 1
             self.eos_token_id = 2
             self.pad_token_id = 0
-            self.vocab_size = 256  # ASCII characters
+            self.vocab_size = max(256, self.answer_end_token_id + 1)
             self._bos = bos_token
             self._eos = eos_token
             self._pad = pad_token
@@ -170,11 +200,13 @@ class MamformerTokenizer:
             ids = [ids]
 
         if skip_special_tokens:
-            ids = [
-                tid
-                for tid in ids
-                if tid not in {self.bos_token_id, self.eos_token_id, self.pad_token_id}
-            ]
+            special_ids = {
+                self.bos_token_id, self.eos_token_id, self.pad_token_id,
+                self.think_start_token_id, self.think_end_token_id,
+                self.answer_start_token_id, self.answer_end_token_id,
+                self.summary_start_token_id,
+            }
+            ids = [tid for tid in ids if tid not in special_ids]
 
         return self._decode(ids, **kwargs)
 
@@ -205,11 +237,37 @@ class MamformerTokenizer:
             return self._tokenizer.pad_token or "<pad>"
         return self._pad
 
+    def get_thinking_token_ids(self) -> dict[str, int]:
+        """Return dict mapping thinking token names to their IDs."""
+        return {
+            "think_start": self.think_start_token_id,
+            "think_end": self.think_end_token_id,
+            "answer_start": self.answer_start_token_id,
+            "answer_end": self.answer_end_token_id,
+            "summary_start": self.summary_start_token_id,
+        }
+
+    def add_thinking_tokens(self, vocab_size: int) -> int:
+        """
+        Ensure the vocabulary is large enough to include thinking control tokens.
+        Returns the (possibly expanded) vocab_size.
+
+        This is a no-op for the tokenizer itself — the actual embedding expansion
+        happens in the model. The tokenizer just ensures its vocab_size accounts
+        for the thinking tokens.
+        """
+        min_vocab = self.answer_end_token_id + 1
+        if self.vocab_size < min_vocab:
+            self.vocab_size = min_vocab
+        return self.vocab_size
+
     def __repr__(self) -> str:
         return (
             f"MamformerTokenizer(vocab_size={self.vocab_size}, "
             f"bos_id={self.bos_token_id}, eos_id={self.eos_token_id}, "
-            f"pad_id={self.pad_token_id})"
+            f"pad_id={self.pad_token_id}, "
+            f"think_start={self.think_start_token_id}, "
+            f"think_end={self.think_end_token_id})"
         )
 
 

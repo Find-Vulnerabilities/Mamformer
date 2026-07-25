@@ -255,6 +255,22 @@ def evaluate_gsm8k(
     if max_samples > 0:
         dataset = dataset[:max_samples]
 
+    # Load few-shot examples from training set
+    n_few_shot = benchmark.get("num_few_shot", 8)
+    few_shot_prompt = ""
+    if n_few_shot > 0:
+        try:
+            train_dataset = list(load_dataset("gsm8k", "main", split="train"))
+            step = max(1, len(train_dataset) // n_few_shot)
+            few_shot_examples = [train_dataset[i] for i in range(0, n_few_shot * step, step)][:n_few_shot]
+            for fs in few_shot_examples:
+                few_shot_prompt += (
+                    f"Question: {fs['question']}\n"
+                    f"Answer: {fs['answer']}\n\n"
+                )
+        except Exception:
+            few_shot_prompt = ""  # Proceed without few-shot if loading fails
+
     correct = 0
     total = 0
 
@@ -263,7 +279,10 @@ def evaluate_gsm8k(
         ground_truth = extract_number(item["answer"])
 
         # Build prompt with few-shot examples
-        prompt = f"Question: {question}\nAnswer: Let's think step by step.\n"
+        prompt = (
+            few_shot_prompt
+            + f"Question: {question}\nAnswer: Let's think step by step.\n"
+        )
         input_ids = tokenizer.encode(prompt, add_bos=True)
         input_tensor = torch.tensor([input_ids], device=device)
 

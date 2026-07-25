@@ -32,7 +32,7 @@ model:
     attn_every_k: 4
     first_layer_attn: true
     last_layers_dense: 2
-    fusion_layers: [30, 31]
+    fusion_layers: [24, 25]
 
   # RoPE settings
   rope:

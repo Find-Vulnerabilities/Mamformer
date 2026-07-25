@@ -25,7 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from mamformer.config import MamformerConfig
 from mamformer.model import MamformerForCausalLM
 from mamformer.tokenizer import MamformerTokenizer, load_tokenizer
-from mamformer.generation import GenerationConfig
+from mamformer.generation import RuntimeGenerationConfig
+from mamformer.thinking import ThinkingConfig, ThinkingMode
 
 
 def load_model(
@@ -81,7 +82,8 @@ def generate_text(
     model: MamformerForCausalLM,
     tokenizer: MamformerTokenizer,
     prompt: str,
-    config: Optional[GenerationConfig] = None,
+    config: Optional[RuntimeGenerationConfig] = None,
+    thinking_cfg: Optional[ThinkingConfig] = None,
     device: str = "cpu",
 ) -> str:
     """
@@ -92,13 +94,14 @@ def generate_text(
         tokenizer: MamformerTokenizer
         prompt: Input text prompt
         config: Generation configuration
+        thinking_cfg: Optional ThinkingConfig for toggleable reasoning mode
         device: Device for tensor operations
 
     Returns:
         Generated text (including prompt)
     """
     if config is None:
-        config = GenerationConfig(
+        config = RuntimeGenerationConfig(
             max_new_tokens=256,
             temperature=0.7,
             top_k=50,
@@ -112,14 +115,45 @@ def generate_text(
 
     # Generate
     with torch.no_grad():
-        output_ids = model.generate(
-            input_ids=input_tensor,
-            max_new_tokens=config.max_new_tokens,
-            temperature=config.temperature,
-            top_k=config.top_k,
-            top_p=config.top_p,
-            eos_token_id=config.eos_token_id,
-        )
+        if thinking_cfg is not None and thinking_cfg.is_active:
+            # ── Multi-path parallel thinking mode ────────────────
+            result = model.generate(
+                input_ids=input_tensor,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p,
+                eos_token_id=config.eos_token_id,
+                thinking_config=thinking_cfg,
+            )
+            # Decode answer
+            answer_ids = result["answer_ids"][0].tolist()
+            answer_text = tokenizer.decode(answer_ids, skip_special_tokens=True)
+
+            if thinking_cfg.show_thinking:
+                parts = []
+                # Decode each thinking path
+                for i, path_tensor in enumerate(result["all_paths"]):
+                    path_ids = path_tensor[0].tolist()
+                    path_text = tokenizer.decode(path_ids, skip_special_tokens=True)
+                    parts.append(f"<think_{i+1}>\n{path_text}\n</think_{i+1}>")
+                # Decode summary
+                summary_ids = result["summary_ids"][0].tolist()
+                summary_text = tokenizer.decode(summary_ids, skip_special_tokens=True)
+                parts.append(f"<summary>\n{summary_text}\n</summary>")
+                parts.append(f"<answer>\n{answer_text}\n</answer>")
+                return "\n\n".join(parts)
+            return answer_text
+        else:
+            # ── Standard generation ──────────────────────────────
+            output_ids = model.generate(
+                input_ids=input_tensor,
+                max_new_tokens=config.max_new_tokens,
+                temperature=config.temperature,
+                top_k=config.top_k,
+                top_p=config.top_p,
+                eos_token_id=config.eos_token_id,
+            )
 
     # Decode
     generated = tokenizer.decode(output_ids[0].tolist(), skip_special_tokens=True)
@@ -130,8 +164,9 @@ def generate_text(
 def interactive_loop(
     model: MamformerForCausalLM,
     tokenizer: MamformerTokenizer,
-    config: GenerationConfig,
+    config: RuntimeGenerationConfig,
     device: str = "cpu",
+    thinking_cfg: Optional[ThinkingConfig] = None,
 ) -> None:
     """
     Interactive chat-like generation loop.
@@ -158,7 +193,10 @@ def interactive_loop(
             break
 
         print()
-        generated = generate_text(model, tokenizer, prompt, config, device)
+        generated = generate_text(
+            model, tokenizer, prompt, config,
+            thinking_cfg=thinking_cfg, device=device,
+        )
         print(generated)
         print()
 
@@ -175,6 +213,17 @@ def main():
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--repetition_penalty", type=float, default=1.0)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--thinking", type=str, default=None,
+                       choices=["NoThink", "FastThink", "CoreThink", "DeepThink"],
+                       help="Enable parallel thinking mode (NoThink to disable)")
+    parser.add_argument("--think_budget", type=int, default=0,
+                       help="Custom thinking token budget per path (0=use mode default)")
+    parser.add_argument("--num_paths", type=int, default=0,
+                       help="Number of parallel reasoning paths (0=use mode default)")
+    parser.add_argument("--summary_budget", type=int, default=0,
+                       help="Custom summary synthesis budget (0=use mode default)")
+    parser.add_argument("--show_thinking", action="store_true",
+                       help="Include thinking tokens in output")
 
     args = parser.parse_args()
 
@@ -186,7 +235,7 @@ def main():
 
     model, tokenizer = load_model(args.config, args.checkpoint, device)
 
-    gen_config = GenerationConfig(
+    gen_config = RuntimeGenerationConfig(
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         top_k=args.top_k,
@@ -197,13 +246,30 @@ def main():
         pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
     )
 
+    # ── Thinking config ───────────────────────────────────────────
+    thinking_cfg = None
+    if args.thinking and args.thinking != "NoThink":
+        thinking_cfg = ThinkingConfig.from_preset(
+            mode=args.thinking,
+            budget=args.think_budget,
+            num_paths=args.num_paths,
+            summary_budget=args.summary_budget,
+            show_thinking=args.show_thinking,
+        )
+        print(f"Thinking: {args.thinking} | paths={thinking_cfg.effective_num_paths} | "
+              f"budget={thinking_cfg.effective_budget}/path | "
+              f"summary={thinking_cfg.effective_summary_budget}")
+
     if args.prompt:
         # Single prompt mode
-        generated = generate_text(model, tokenizer, args.prompt, gen_config, device)
+        generated = generate_text(
+            model, tokenizer, args.prompt, gen_config,
+            thinking_cfg=thinking_cfg, device=device,
+        )
         print(generated)
     else:
         # Interactive mode
-        interactive_loop(model, tokenizer, gen_config, device)
+        interactive_loop(model, tokenizer, gen_config, device, thinking_cfg=thinking_cfg)
 
 
 if __name__ == "__main__":

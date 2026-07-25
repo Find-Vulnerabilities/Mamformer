@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 import torch
@@ -83,7 +84,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freqs", freqs, persistent=False)
 
         # Cache for dynamic computation (seq_len, offset) -> (cos, sin)
-        self._cache: dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._cache: OrderedDict = OrderedDict()
         self._cache_max_size = 16  # Keep last 16 entries
 
     def _compute_freqs(

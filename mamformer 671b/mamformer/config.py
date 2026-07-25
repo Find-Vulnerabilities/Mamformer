@@ -331,6 +331,13 @@ class GenerationConfig:
     default_top_p: float = 0.9        # Default top-p
     repetition_penalty: float = 1.0   # Default repetition penalty
 
+    # ── Thinking mode defaults ──────────────────────────────────────
+    thinking_enabled: bool = False     # Enable thinking mode by default
+    thinking_mode: str = "NoThink"    # Default thinking intensity
+    thinking_budget: int = 0          # Default thinking token budget per path (0=mode default)
+    thinking_num_paths: int = 0       # Default number of parallel paths (0=mode default)
+    thinking_summary_budget: int = 0  # Default summary synthesis budget (0=mode default)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Main Config
@@ -529,7 +536,9 @@ class MamformerConfig:
     # ── Serialization ─────────────────────────────────────────────────
 
     def to_dict(self) -> dict:
-        return {
+        """Serialize config to a flat dictionary. Uses _SUB_CONFIG_MAPS
+        so adding a field only requires updating the map, not this method."""
+        d = {
             "name": self.name, "model_type": self.model_type,
             "description": self.description,
             "d_model": self.d_model, "n_layers": self.n_layers,
@@ -539,78 +548,15 @@ class MamformerConfig:
             "tie_word_embeddings": self.tie_word_embeddings,
             "use_sliding_window": self.use_sliding_window,
             "sliding_window": self.sliding_window,
-            # Mamba
-            "mamba_expand": self.mamba.expand,
-            "mamba_d_state": self.mamba.d_state,
-            "mamba_d_conv": self.mamba.d_conv,
-            "mamba_dt_rank": self.mamba.dt_rank,
-            # RoPE
-            "rope_theta": self.rope.theta,
-            "rope_use_yarn": self.rope.use_yarn,
-            "rope_yarn_scale": self.rope.yarn_scale,
-            "rope_yarn_original_max_seq_len": self.rope.yarn_original_max_seq_len,
-            "rope_yarn_beta_fast": self.rope.yarn_beta_fast,
-            "rope_yarn_beta_slow": self.rope.yarn_beta_slow,
-            # MoE
-            "moe_enabled": self.moe.enabled,
-            "moe_n_shared_experts": self.moe.n_shared_experts,
-            "moe_shared_expert_intermediate_dim": self.moe.shared_expert_intermediate_dim,
-            "moe_n_routed_experts": self.moe.n_routed_experts,
-            "moe_top_k": self.moe.top_k,
-            "moe_expert_intermediate_dim": self.moe.routed_expert_intermediate_dim,
-            "moe_router_temperature": self.moe.router_temperature,
-            "moe_aux_loss_free": self.moe.aux_loss_free,
-            "moe_bias_update_speed": self.moe.bias_update_speed,
-            "moe_expert_dropout": self.moe.expert_dropout,
-            "moe_target_expert_load": self.moe.target_expert_load,
-            # DSA
-            "dsa_enabled": self.dsa.enabled,
-            "dsa_lambda_init": self.dsa.lambda_init,
-            "dsa_use_state_injection": self.dsa.use_state_injection,
-            "dsa_state_injection_dim": self.dsa.state_injection_dim,
-            "dsa_num_attn_groups": self.dsa.num_attn_groups,
-            # KDA-Diff
-            "kda_diff_enabled": self.kda_diff.enabled,
-            "kda_diff_linear_ratio": self.kda_diff.linear_ratio,
-            "kda_diff_kernel_dim": self.kda_diff.kernel_dim,
-            "kda_diff_latent_dim": self.kda_diff.latent_dim,
-            "kda_diff_use_dynamic_ratio": self.kda_diff.use_dynamic_ratio,
-            # MTP
-            "mtp_enabled": self.mtp.enabled,
-            "mtp_depth": self.mtp.depth,
-            "mtp_loss_weight": self.mtp.loss_weight,
-            "mtp_d_model": self.mtp.mtp_d_model,
-            # ST-MoE
-            "st_moe_enabled": self.st_moe.enabled,
-            "st_moe_lambda_init": self.st_moe.lambda_init,
-            "st_moe_lambda_max": self.st_moe.lambda_max,
-            "st_moe_learnable_lambda": self.st_moe.learnable_lambda,
-            "st_moe_use_balance_lock": self.st_moe.use_balance_lock,
-            "st_moe_balance_lock_threshold": self.st_moe.balance_lock_threshold,
-            # Communicative MoE
-            "comm_moe_enabled": self.communicative_moe.enabled,
-            "comm_moe_n_heads": self.communicative_moe.n_comm_heads,
-            "comm_moe_depth": self.communicative_moe.comm_depth,
-            "comm_moe_dropout": self.communicative_moe.comm_dropout,
-            # Interleave
-            "interleave_enabled": self.interleave.enabled,
-            "interleave_pattern": self.interleave.pattern,
-            "interleave_attn_every_k": self.interleave.attn_every_k,
-            "interleave_first_layer_attn": self.interleave.first_layer_attn,
-            "interleave_last_layers_dense": self.interleave.last_layers_dense,
-            "interleave_attention_layers": self.interleave.attention_layers,
-            "interleave_fusion_layers": self.interleave.fusion_layers,
-            # Generation
-            "gen_max_context": self.generation.max_context,
-            "gen_max_output_tokens": self.generation.max_output_tokens,
-            "gen_default_temperature": self.generation.default_temperature,
-            "gen_default_top_k": self.generation.default_top_k,
-            "gen_default_top_p": self.generation.default_top_p,
-            "gen_repetition_penalty": self.generation.repetition_penalty,
-            # Regularization
             "dropout": self.dropout, "rms_norm_eps": self.rms_norm_eps,
             "initializer_range": self.initializer_range,
         }
+        # Flatten sub-configs using shared map
+        for attr_name, _prefix, field_map in _SUB_CONFIG_MAPS:
+            sub = getattr(self, attr_name)
+            for src_key, flat_key in field_map.items():
+                d[flat_key] = getattr(sub, src_key)
+        return d
 
     def to_yaml(self, path: str) -> None:
         with open(path, "w") as f:
@@ -618,86 +564,29 @@ class MamformerConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "MamformerConfig":
-        mamba_cfg = MambaConfig(
-            expand=d.get("mamba_expand", 1),
-            d_state=d.get("mamba_d_state", 128),
-            d_conv=d.get("mamba_d_conv", 4),
-            dt_rank=d.get("mamba_dt_rank", "auto"),
-        )
-        rope_cfg = RopeConfig(
-            theta=d.get("rope_theta", 10000.0),
-            use_yarn=d.get("rope_use_yarn", False),
-            yarn_scale=d.get("rope_yarn_scale", 1.0),
-            yarn_original_max_seq_len=d.get("rope_yarn_original_max_seq_len", 8192),
-            yarn_beta_fast=d.get("rope_yarn_beta_fast", 32),
-            yarn_beta_slow=d.get("rope_yarn_beta_slow", 1),
-        )
-        moe_cfg = MoEConfig(
-            enabled=d.get("moe_enabled", False),
-            n_shared_experts=d.get("moe_n_shared_experts", 2),
-            shared_expert_intermediate_dim=d.get("moe_shared_expert_intermediate_dim", 2304),
-            n_routed_experts=d.get("moe_n_routed_experts", 64),
-            top_k=d.get("moe_top_k", 8),
-            expert_intermediate_dim=d.get("moe_expert_intermediate_dim", 576),
-            router_temperature=d.get("moe_router_temperature", 1.0),
-            aux_loss_free=d.get("moe_aux_loss_free", True),
-            bias_update_speed=d.get("moe_bias_update_speed", 0.001),
-            expert_dropout=d.get("moe_expert_dropout", 0.0),
-            target_expert_load=d.get("moe_target_expert_load", 1.0),
-        )
-        dsa_cfg = DSAConfig(
-            enabled=d.get("dsa_enabled", False),
-            lambda_init=d.get("dsa_lambda_init", 0.8),
-            use_state_injection=d.get("dsa_use_state_injection", True),
-            state_injection_dim=d.get("dsa_state_injection_dim", 64),
-            num_attn_groups=d.get("dsa_num_attn_groups", 2),
-        )
-        kda_diff_cfg = KDADiffConfig(
-            enabled=d.get("kda_diff_enabled", False),
-            linear_ratio=d.get("kda_diff_linear_ratio", 3),
-            kernel_dim=d.get("kda_diff_kernel_dim", 128),
-            latent_dim=d.get("kda_diff_latent_dim", 512),
-            use_dynamic_ratio=d.get("kda_diff_use_dynamic_ratio", True),
-        )
-        mtp_cfg = MTPConfig(
-            enabled=d.get("mtp_enabled", False),
-            depth=d.get("mtp_depth", 2),
-            loss_weight=d.get("mtp_loss_weight", 0.3),
-            mtp_d_model=d.get("mtp_d_model", 0),
-        )
-        st_moe_cfg = STMoEConfig(
-            enabled=d.get("st_moe_enabled", False),
-            lambda_init=d.get("st_moe_lambda_init", 0.2),
-            lambda_max=d.get("st_moe_lambda_max", 0.3),
-            learnable_lambda=d.get("st_moe_learnable_lambda", True),
-            use_balance_lock=d.get("st_moe_use_balance_lock", True),
-            balance_lock_threshold=d.get("st_moe_balance_lock_threshold", 50),
-        )
-        comm_moe_cfg = CommunicativeMoEConfig(
-            enabled=d.get("comm_moe_enabled", False),
-            n_comm_heads=d.get("comm_moe_n_heads", 4),
-            comm_depth=d.get("comm_moe_depth", 1),
-            comm_dropout=d.get("comm_moe_dropout", 0.0),
-        )
-        interleave_cfg = InterleaveConfig(
-            enabled=d.get("interleave_enabled", False),
-            pattern=d.get("interleave_pattern", "attn_every_k"),
-            attn_every_k=d.get("interleave_attn_every_k", 4),
-            first_layer_attn=d.get("interleave_first_layer_attn", True),
-            last_layers_dense=d.get("interleave_last_layers_dense", 2),
-            attention_layers=d.get("interleave_attention_layers", []),
-            fusion_layers=d.get("interleave_fusion_layers", []),
-        )
-        gen_cfg = GenerationConfig(
-            max_context=d.get("gen_max_context", d.get("max_seq_len", 8192)),
-            max_output_tokens=d.get("gen_max_output_tokens", 4096),
-            default_temperature=d.get("gen_default_temperature", 0.7),
-            default_top_k=d.get("gen_default_top_k", 50),
-            default_top_p=d.get("gen_default_top_p", 0.9),
-            repetition_penalty=d.get("gen_repetition_penalty", 1.0),
-        )
+        """Deserialize from flat dict. Sub-config field extraction uses
+        _SUB_CONFIG_MAPS — adding a field only requires updating the map."""
+
+        # Build sub-configs from flat keys using shared field map
+        sub_configs = {}
+        # Mapping: attr_name → config class
+        _CFG_CLASSES = {
+            "mamba": MambaConfig, "rope": RopeConfig, "moe": MoEConfig,
+            "dsa": DSAConfig, "kda_diff": KDADiffConfig, "mtp": MTPConfig,
+            "st_moe": STMoEConfig, "communicative_moe": CommunicativeMoEConfig,
+            "interleave": InterleaveConfig, "generation": GenerationConfig,
+        }
+        for attr_name, _prefix, field_map in _SUB_CONFIG_MAPS:
+            cfg_cls = _CFG_CLASSES[attr_name]
+            # Read flat-key → constructor arg
+            kwargs = {}
+            for src_key, flat_key in field_map.items():
+                kwargs[src_key] = d.get(flat_key, _default_for_field(cfg_cls, src_key))
+            sub_configs[attr_name] = cfg_cls(**kwargs)
+
         return cls(
             name=d.get("name", "Mamformer"),
+            model_type=d.get("model_type", "Mamformer"),
             d_model=d.get("d_model", 4096),
             n_layers=d.get("n_layers", 32),
             n_heads=d.get("n_heads", 32),
@@ -709,15 +598,11 @@ class MamformerConfig:
             tie_word_embeddings=d.get("tie_word_embeddings", True),
             use_sliding_window=d.get("use_sliding_window", False),
             sliding_window=d.get("sliding_window", 4096),
-            mamba=mamba_cfg, rope=rope_cfg, moe=moe_cfg,
-            dsa=dsa_cfg, kda_diff=kda_diff_cfg, mtp=mtp_cfg, st_moe=st_moe_cfg,
-            communicative_moe=comm_moe_cfg,
-            interleave=interleave_cfg,
-            generation=gen_cfg,
             dropout=d.get("dropout", 0.0),
             rms_norm_eps=d.get("rms_norm_eps", 1e-6),
             initializer_range=d.get("initializer_range", 0.02),
             description=d.get("description", ""),
+            **sub_configs,
         )
 
     @classmethod
@@ -730,63 +615,9 @@ class MamformerConfig:
         else:
             d = raw
 
-        # Flatten nested sub-configs from YAML
-        _flatten_nested(d, "mamba",
-                        {"expand": "mamba_expand", "d_state": "mamba_d_state",
-                         "d_conv": "mamba_d_conv", "dt_rank": "mamba_dt_rank"})
-        _flatten_nested(d, "rope",
-                        {"theta": "rope_theta", "use_yarn": "rope_use_yarn",
-                         "yarn_scale": "rope_yarn_scale",
-                         "yarn_original_max_seq_len": "rope_yarn_original_max_seq_len"})
-        _flatten_nested(d, "moe",
-                        {"enabled": "moe_enabled",
-                         "n_shared_experts": "moe_n_shared_experts",
-                         "shared_expert_intermediate_dim": "moe_shared_expert_intermediate_dim",
-                         "n_routed_experts": "moe_n_routed_experts",
-                         "top_k": "moe_top_k",
-                         "expert_intermediate_dim": "moe_expert_intermediate_dim",
-                         "router_temperature": "moe_router_temperature",
-                         "aux_loss_free": "moe_aux_loss_free",
-                         "bias_update_speed": "moe_bias_update_speed"})
-        _flatten_nested(d, "dsa",
-                        {"enabled": "dsa_enabled", "lambda_init": "dsa_lambda_init",
-                         "use_state_injection": "dsa_use_state_injection",
-                         "state_injection_dim": "dsa_state_injection_dim"})
-        _flatten_nested(d, "kda_diff",
-                        {"enabled": "kda_diff_enabled",
-                         "linear_ratio": "kda_diff_linear_ratio",
-                         "kernel_dim": "kda_diff_kernel_dim",
-                         "latent_dim": "kda_diff_latent_dim",
-                         "use_dynamic_ratio": "kda_diff_use_dynamic_ratio"})
-        _flatten_nested(d, "mtp",
-                        {"enabled": "mtp_enabled", "depth": "mtp_depth",
-                         "loss_weight": "mtp_loss_weight"})
-        _flatten_nested(d, "st_moe",
-                        {"enabled": "st_moe_enabled",
-                         "lambda_init": "st_moe_lambda_init",
-                         "lambda_max": "st_moe_lambda_max",
-                         "learnable_lambda": "st_moe_learnable_lambda",
-                         "use_balance_lock": "st_moe_use_balance_lock",
-                         "balance_lock_threshold": "st_moe_balance_lock_threshold"})
-        _flatten_nested(d, "communicative_moe",
-                        {"enabled": "comm_moe_enabled",
-                         "n_comm_heads": "comm_moe_n_heads",
-                         "comm_depth": "comm_moe_depth",
-                         "comm_dropout": "comm_moe_dropout"})
-        _flatten_nested(d, "interleave",
-                        {"enabled": "interleave_enabled",
-                         "pattern": "interleave_pattern",
-                         "attn_every_k": "interleave_attn_every_k",
-                         "first_layer_attn": "interleave_first_layer_attn",
-                         "last_layers_dense": "interleave_last_layers_dense",
-                         "attention_layers": "interleave_attention_layers",
-                         "fusion_layers": "interleave_fusion_layers"})
-        _flatten_nested(d, "generation",
-                        {"max_context": "gen_max_context",
-                         "max_output_tokens": "gen_max_output_tokens",
-                         "default_temperature": "gen_default_temperature",
-                         "default_top_k": "gen_default_top_k",
-                         "default_top_p": "gen_default_top_p"})
+        # Flatten nested sub-configs from YAML using shared field map
+        for nested_key, _prefix, field_map in _SUB_CONFIG_MAPS:
+            _flatten_nested(d, nested_key, field_map)
 
         return cls.from_dict(d)
 
@@ -806,6 +637,7 @@ class MamformerConfig:
         Ultra (MoE + DSA + MTP):
           - "ultra-7b":   ~39B total / ~7.5B active, 8K context, 4K output
           - "ultra-37b":  ~200B total / ~37B active, 128K context, 32K output
+          - "ultra-371b": ~371B total / ~28B active, 256K context, 65K output
           - "ultra-671b": ~671B total / ~37B active, 1M context, 163K output (MAX)
         """
         if name in ("7b", "1b", "300m", "debug"):
@@ -890,6 +722,99 @@ class MamformerConfig:
 # ═══════════════════════════════════════════════════════════════════════
 # Preset Builders
 # ═══════════════════════════════════════════════════════════════════════
+
+# ── Shared field maps for serialization ──────────────────────────────────
+# Each sub-config defines its flat-key prefix and a dict mapping
+# config attributes → flat YAML keys. Adding a new config field only
+# requires updating the relevant map below (not to_dict, from_dict, AND
+# _flatten_nested separately).
+
+_SUB_CONFIG_MAPS = [
+    ("mamba", "mamba", {
+        "expand": "mamba_expand", "d_state": "mamba_d_state",
+        "d_conv": "mamba_d_conv", "dt_rank": "mamba_dt_rank",
+    }),
+    ("rope", "rope", {
+        "theta": "rope_theta", "use_yarn": "rope_use_yarn",
+        "yarn_scale": "rope_yarn_scale",
+        "yarn_original_max_seq_len": "rope_yarn_original_max_seq_len",
+        "yarn_beta_fast": "rope_yarn_beta_fast",
+        "yarn_beta_slow": "rope_yarn_beta_slow",
+    }),
+    ("moe", "moe", {
+        "enabled": "moe_enabled",
+        "n_shared_experts": "moe_n_shared_experts",
+        "shared_expert_intermediate_dim": "moe_shared_expert_intermediate_dim",
+        "n_routed_experts": "moe_n_routed_experts",
+        "top_k": "moe_top_k",
+        "expert_intermediate_dim": "moe_expert_intermediate_dim",
+        "router_temperature": "moe_router_temperature",
+        "aux_loss_free": "moe_aux_loss_free",
+        "bias_update_speed": "moe_bias_update_speed",
+        "expert_dropout": "moe_expert_dropout",
+        "target_expert_load": "moe_target_expert_load",
+    }),
+    ("dsa", "dsa", {
+        "enabled": "dsa_enabled", "lambda_init": "dsa_lambda_init",
+        "use_state_injection": "dsa_use_state_injection",
+        "state_injection_dim": "dsa_state_injection_dim",
+        "num_attn_groups": "dsa_num_attn_groups",
+    }),
+    ("kda_diff", "kda_diff", {
+        "enabled": "kda_diff_enabled",
+        "linear_ratio": "kda_diff_linear_ratio",
+        "kernel_dim": "kda_diff_kernel_dim",
+        "latent_dim": "kda_diff_latent_dim",
+        "use_dynamic_ratio": "kda_diff_use_dynamic_ratio",
+    }),
+    ("mtp", "mtp", {
+        "enabled": "mtp_enabled", "depth": "mtp_depth",
+        "loss_weight": "mtp_loss_weight", "mtp_d_model": "mtp_d_model",
+    }),
+    ("st_moe", "st_moe", {
+        "enabled": "st_moe_enabled",
+        "lambda_init": "st_moe_lambda_init",
+        "lambda_max": "st_moe_lambda_max",
+        "learnable_lambda": "st_moe_learnable_lambda",
+        "use_balance_lock": "st_moe_use_balance_lock",
+        "balance_lock_threshold": "st_moe_balance_lock_threshold",
+    }),
+    ("communicative_moe", "comm_moe", {
+        "enabled": "comm_moe_enabled",
+        "n_comm_heads": "comm_moe_n_heads",
+        "comm_depth": "comm_moe_depth",
+        "comm_dropout": "comm_moe_dropout",
+    }),
+    ("interleave", "interleave", {
+        "enabled": "interleave_enabled",
+        "pattern": "interleave_pattern",
+        "attn_every_k": "interleave_attn_every_k",
+        "first_layer_attn": "interleave_first_layer_attn",
+        "last_layers_dense": "interleave_last_layers_dense",
+        "attention_layers": "interleave_attention_layers",
+        "fusion_layers": "interleave_fusion_layers",
+    }),
+    ("generation", "gen", {
+        "max_context": "gen_max_context",
+        "max_output_tokens": "gen_max_output_tokens",
+        "default_temperature": "gen_default_temperature",
+        "default_top_k": "gen_default_top_k",
+        "default_top_p": "gen_default_top_p",
+        "repetition_penalty": "gen_repetition_penalty",
+        "thinking_enabled": "gen_thinking_enabled",
+        "thinking_mode": "gen_thinking_mode",
+        "thinking_budget": "gen_thinking_budget",
+        "thinking_num_paths": "gen_thinking_num_paths",
+        "thinking_summary_budget": "gen_thinking_summary_budget",
+    }),
+]
+
+
+def _default_for_field(cls, field_name: str):
+    """Get the default value for a dataclass field by instantiating the class."""
+    instance = cls()
+    return getattr(instance, field_name)
+
 
 def _flatten_nested(d: dict, key: str, mapping: dict) -> None:
     """Flatten a nested dict key into top-level keys using mapping."""

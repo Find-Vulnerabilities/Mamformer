@@ -285,6 +285,47 @@ def _extract_code(response: str) -> Optional[str]:
     return None
 
 
+def _is_safe_test_input(s: str) -> bool:
+    """Check that test_input doesn't contain code-injection patterns.
+    This is a pre-filter; the main protection is the restricted builtins."""
+    dangerous = ["__import__", "os.system", "subprocess", "eval(", "exec(",
+                 "open(", "rm -", "shutil", "import ", "compile("]
+    return not any(d in s.lower() for d in dangerous)
+
+
+def _scan_user_code(code: str) -> Optional[str]:
+    """
+    Scan user code for sandbox bypass attempts. Returns None if safe,
+    or a string describing the violation.
+    """
+    import re as _re
+
+    # Check for attempts to access unrestricted builtins
+    bypass_patterns = [
+        (r'__import__', 'direct __import__ call'),
+        (r'\bopen\s*\(', 'open() call'),
+        (r'\beval\s*\(', 'eval() call'),
+        (r'\bexec\s*\(', 'exec() call'),
+        (r'\bcompile\s*\(', 'compile() call'),
+        (r'\bglobals\s*\(\s*\)', 'globals() access'),
+        (r'\blocals\s*\(\s*\)', 'locals() access'),
+        (r'\bgetattr\s*\(', 'getattr() — potential builtins bypass'),
+        (r'__builtins__', 'direct __builtins__ access'),
+        (r'__class__\s*\.', 'dunder class traversal'),
+        (r'__bases__', 'dunder bases traversal'),
+        (r'__subclasses__\s*\(\s*\)', 'subclass enumeration'),
+        (r'__globals__', 'dunder globals access'),
+        (r'\b(?:import|from)\s+\w+', 'import statement'),
+        (r'__import__', 'import via dunder'),
+        (r'breakpoint\s*\(', 'breakpoint() call'),
+        (r'copyright|credits|license', 'interactive-help builtin'),
+    ]
+    for pattern, desc in bypass_patterns:
+        if _re.search(pattern, code):
+            return f"Forbidden pattern in user code: {desc}"
+    return None
+
+
 def _run_single_test(
     code: str,
     function_name: str,
@@ -292,46 +333,59 @@ def _run_single_test(
     expected_output: str,
     timeout: int = 30,
 ) -> bool:
-    """
-    Run a single test case against the extracted code.
-
-    Returns True if the function output matches expected_output.
-
-    Security: uses a temporary file + restricted subprocess (no shell).
-    """
+    """Run a single test case in a restricted-builtins sandbox.
+    Dangerous builtins (__import__, open, eval, exec, etc.) are
+    deleted before user code executes."""
     import os as _os
     import json as _json
-
-    # Validate test_input — only allow safe characters (no code injection)
-    if not _is_safe_test_input(test_input):
-        return False
-
-    # Validate function_name: only allow valid Python identifiers
     import re as _re
+
     if not _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', function_name):
         return False
 
-    # Build test harness
+    violation = _scan_user_code(code)
+    if violation is not None:
+        return False
+
+    if not _is_safe_test_input(test_input):
+        return False
+
     harness_lines = [
         "import sys, json",
+        "",
+        "# Delete dangerous builtins from __dict__",
+        "_DANGEROUS = [",
+        '    "__import__", "open", "eval", "exec", "compile",',
+        '    "globals", "locals", "vars", "dir",',
+        '    "getattr", "setattr", "delattr", "hasattr",',
+        '    "breakpoint", "input",',
+        '    "copyright", "credits", "license", "help",',
+        "]",
+        "import builtins",
+        "_bd = builtins.__dict__",
+        "for _name in _DANGEROUS:",
+        "    _bd.pop(_name, None)",
+        "if isinstance(__builtins__, dict):",
+        "    for _name in _DANGEROUS:",
+        "        __builtins__.pop(_name, None)",
+        "",
         "# User code",
         code,
         "",
-        "# Test harness: use json.loads to safely parse input",
+        "# Test harness",
         "_input = json.loads(sys.argv[1])",
         "_expected = json.loads(sys.argv[2])",
         "try:",
         f"    _result = str({function_name}(*_input)) if isinstance(_input, list) else str({function_name}(_input))",
-        "    if _result.strip() == str(_expected).strip():",
-        "        print('PASS')",
-        "    else:",
-        "        print('FAIL')",
-        "except Exception as e:",
-        "    print('FAIL')",
+        '    if _result.strip() == str(_expected).strip():',
+        '        print("PASS")',
+        '    else:',
+        '        print("FAIL")',
+        'except Exception:',
+        '    print("FAIL")',
     ]
     test_script = "\n".join(harness_lines)
 
-    # Parse input safely: try as JSON, fallback to simple types
     try:
         input_val = _json.loads(test_input) if test_input.strip() else ""
     except (_json.JSONDecodeError, ValueError):
@@ -342,68 +396,170 @@ def _run_single_test(
         expected_val = expected_output
 
     try:
+        preexec_fn = None
+        try:
+            import resource
+            def _limit():
+                resource.setrlimit(resource.RLIMIT_AS, (512*1024*1024, 512*1024*1024))
+            preexec_fn = _limit
+        except (ImportError, ValueError):
+            pass
+
         result = subprocess.run(
             ["python", "-c", test_script,
              _json.dumps(input_val), _json.dumps(expected_val)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=tempfile.gettempdir(),
+            capture_output=True, text=True, timeout=timeout,
+            cwd=tempfile.gettempdir(), preexec_fn=preexec_fn,
         )
         return "PASS" in result.stdout and "FAIL" not in result.stdout
     except (subprocess.TimeoutExpired, Exception):
         return False
 
 
-def _is_safe_test_input(s: str) -> bool:
-    """Check that test_input doesn't contain code-injection patterns."""
-    dangerous = ["__import__", "os.system", "subprocess", "eval(", "exec(",
-                 "open(", "rm -", "shutil", "import ", "compile("]
-    return not any(d in s.lower() for d in dangerous)
 
-
-# ═══════════════════════════════════════════════════════════════════════
 # Length Penalty
 # ═══════════════════════════════════════════════════════════════════════
 
 def length_penalty(
     response: str,
-    min_tokens: int = 50,
-    max_tokens: int = 4096,
-    target_tokens: int = 512,
+    min_words: int = 50,
+    max_words: int = 4096,
+    target_words: int = 512,
+    # ── Deprecated aliases (kept for backward compatibility) ──
+    min_tokens: int = None,
+    max_tokens: int = None,
+    target_tokens: int = None,
 ) -> float:
     """
     Penalize responses that are too short or too long.
 
-    Uses a Gaussian-like penalty centered on target_tokens:
-        - Responses near target_tokens get score ~1.0
-        - Very short responses (< min_tokens) get score ~0.0
-        - Very long responses (> max_tokens) get linearly decreasing score
+    Uses word count (whitespace split) as a fast approximation for length.
+    NOTE: This counts WORDS, not tokens. A rough heuristic: tokens ≈ 1.3× words.
+    For precise token-level control, pass an actual tokenizer.
 
     Args:
         response: Full model response text
-        min_tokens: Minimum acceptable length (tokens)
-        max_tokens: Maximum acceptable length (tokens)
-        target_tokens: Ideal response length (tokens)
+        min_words: Minimum acceptable length in words
+        max_words: Maximum acceptable length in words
+        target_words: Ideal response length in words
+        min_tokens: Deprecated — use min_words
+        max_tokens: Deprecated — use max_words
+        target_tokens: Deprecated — use target_words
 
     Returns:
         Score in [0, 1]
     """
-    # Rough token count: split on whitespace
-    tokens = len(response.split())
+    # Backward compat: old parameter names
+    if min_tokens is not None:
+        min_words = min_tokens
+    if max_tokens is not None:
+        max_words = max_tokens
+    if target_tokens is not None:
+        target_words = target_tokens
 
-    if tokens <= min_tokens:
-        return tokens / max(min_tokens, 1)
-    elif tokens <= target_tokens:
+    # Rough word count: split on whitespace
+    n_words = len(response.split())
+
+    if n_words <= min_words:
+        return n_words / max(min_words, 1)
+    elif n_words <= target_words:
         # Linear ramp from min to target
-        return min_tokens / target_tokens + (1.0 - min_tokens / target_tokens) * (
-            (tokens - min_tokens) / (target_tokens - min_tokens)
+        return min_words / target_words + (1.0 - min_words / target_words) * (
+            (n_words - min_words) / (target_words - min_words)
         )
-    elif tokens <= max_tokens:
+    elif n_words <= max_words:
         # Linear decay from target to max
-        return 1.0 - 0.5 * ((tokens - target_tokens) / (max_tokens - target_tokens))
+        return 1.0 - 0.5 * ((n_words - target_words) / (max_words - target_words))
     else:
         return 0.5
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Thinking Quality Reward
+# ═══════════════════════════════════════════════════════════════════════
+
+def thinking_quality_reward(response: str) -> float:
+    """
+    Score the quality of thinking in a response that uses thinking tokens.
+
+    Evaluates:
+      1. Structure: does the response contain thinking markers?
+      2. Substance: is there meaningful content in the thinking sections?
+      3. Separation: is thinking separated from the final answer?
+
+    Scoring:
+      - 1.0: Well-structured thinking with markers + substantive reasoning
+      - 0.7: Has markers but thinking content is shallow (< 20 chars)
+      - 0.4: Has some markers but incomplete structure
+      - 0.0: No thinking markers at all
+
+    Args:
+        response: Full model response text
+
+    Returns:
+        Score in [0, 1]
+    """
+    score = 0.0
+
+    # Check for thinking control tokens (both text and token forms)
+    has_think_start = bool(re.search(
+        r'<\|think_start\|>|<think_start>|<think>|<thinking>',
+        response, re.IGNORECASE,
+    ))
+    has_think_end = bool(re.search(
+        r'<\|think_end\|>|<think_end>|</think>|</thinking>',
+        response, re.IGNORECASE,
+    ))
+    has_answer_start = bool(re.search(
+        r'<\|answer_start\|>|<answer_start>|<answer>',
+        response, re.IGNORECASE,
+    ))
+
+    # Structure score
+    if has_think_start and has_think_end and has_answer_start:
+        score += 0.4
+    elif has_think_start and has_answer_start:
+        score += 0.25
+    elif has_think_start:
+        score += 0.1
+
+    # Substance: extract thinking content and check depth
+    think_patterns = [
+        r'<\|think_start\|>(.*?)<\|think_end\|>',
+        r'<think_start>(.*?)<think_end>',
+        r'<think>(.*?)</think>',
+        r'<thinking>(.*?)</thinking>',
+    ]
+    for pat in think_patterns:
+        m = re.search(pat, response, re.DOTALL | re.IGNORECASE)
+        if m:
+            content = m.group(1).strip()
+            if len(content) > 100:
+                score += 0.3  # Substantive reasoning
+            elif len(content) > 20:
+                score += 0.2  # Some reasoning
+            else:
+                score += 0.05  # Token thinking
+            break
+
+    # Separation: thinking should come before answer
+    if has_think_start and has_answer_start:
+        think_pos = response.lower().find('<think')
+        answer_pos = response.lower().find('<answer')
+        if think_pos >= 0 and answer_pos >= 0 and think_pos < answer_pos:
+            score += 0.2  # Correct order
+        elif think_pos >= 0 and answer_pos >= 0:
+            score += 0.1  # Wrong order but both present
+
+    # Diversity bonus: multiple distinct thinking paths
+    path_markers = len(re.findall(
+        r'<\|think_start\|>|<think_start>|<think>',
+        response, re.IGNORECASE,
+    ))
+    if path_markers > 1:
+        score += 0.1  # Multi-path bonus
+
+    return min(score, 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -435,6 +591,7 @@ class RewardCalculator:
         "format": format_reward,
         "code": code_reward,
         "length": length_penalty,
+        "thinking": thinking_quality_reward,
     }
 
     def compute(

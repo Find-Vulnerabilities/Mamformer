@@ -473,8 +473,11 @@ class ParallelismMonitor:
         if self._step_start_time is not None:
             total_step_time = time.perf_counter() - self._step_start_time
             comm_time = self.comm_monitor.get_total_comm_time()
+            # compute_time = total - comm (idle cannot be separated without
+            # per-GPU utilization telemetry; bubble ratio is estimated from
+            # the theoretical pipeline formula instead)
             compute_time = max(0, total_step_time - comm_time)
-            idle_time = max(0, total_step_time - compute_time - comm_time)
+            idle_time = 0.0  # Not separately measurable at runtime
 
             # Wire actual measurements into bubble analyzer
             self.bubble_analyzer.record_step(compute_time, idle_time)
@@ -535,6 +538,11 @@ class ParallelismMonitor:
 
         print(f"{separator}\n")
 
+        # Reset per-window accumulators for the next logging window
+        self.comm_monitor.reset()
+        self._step_losses.clear()
+        self._step_compute_time = 0.0
+
         # Reset accumulators for next window
         self._step_losses.clear()
         self._step_compute_time = 0.0
@@ -550,7 +558,11 @@ class ParallelismMonitor:
         }
 
     def reset(self):
-        """Reset all statistics."""
+        """Reset all statistics (safe to call mid-training)."""
         self.comm_monitor.reset()
+        self.bubble_analyzer.reset()
+        self.load_analyzer.reset()
         self._step_losses.clear()
         self._step_compute_time = 0.0
+        self._step_start_time = None
+        self._step_tokens = 0

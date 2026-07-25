@@ -10,7 +10,7 @@ import torch
 from mamformer.config import MamformerConfig
 from mamformer.model import MamformerForCausalLM
 from mamformer.tokenizer import MamformerTokenizer
-from mamformer.generation import GenerationConfig
+from mamformer.generation import RuntimeGenerationConfig
 
 
 class TestMamformerTokenizer:
@@ -103,7 +103,7 @@ class TestGeneration:
         assert output.shape[1] == 4 + 10
 
     def test_temperature_sampling(self, model):
-        """Temperature > 0 should produce different outputs with different seeds."""
+        """Temperature > 0 should produce non-empty outputs."""
         input_ids = torch.randint(0, 500, (1, 4))
         model.eval()
 
@@ -111,12 +111,8 @@ class TestGeneration:
         with torch.no_grad():
             out1 = model.generate(input_ids, max_new_tokens=8, temperature=1.0, top_k=10)
 
-        torch.manual_seed(123)
-        with torch.no_grad():
-            out2 = model.generate(input_ids, max_new_tokens=8, temperature=1.0, top_k=10)
-
-        # With different seeds and temperature > 0, outputs may differ
-        # (Note: they might coincide by chance with tiny vocab, but very unlikely with top_k=10)
+        assert out1.shape[0] == 1
+        assert out1.shape[1] >= 4 + 1  # prompt + at least 1 generated token
 
     def test_top_k(self, model):
         """Top-k should work without errors."""
@@ -159,18 +155,18 @@ class TestGeneration:
 
 
 class TestGenerationConfig:
-    """Test GenerationConfig validation."""
+    """Test RuntimeGenerationConfig validation."""
 
     def test_valid_config(self):
-        config = GenerationConfig(temperature=0.7, top_k=50, top_p=0.9)
+        config = RuntimeGenerationConfig(temperature=0.7, top_k=50, top_p=0.9)
         config.validate()  # Should not raise
 
     def test_invalid_temperature(self):
-        config = GenerationConfig(temperature=-0.5)
+        config = RuntimeGenerationConfig(temperature=-0.5)
         with pytest.raises(ValueError):
             config.validate()
 
     def test_beam_search_with_sampling(self):
-        config = GenerationConfig(num_beams=4, temperature=0.7)
+        config = RuntimeGenerationConfig(num_beams=4, temperature=0.7)
         with pytest.raises(ValueError):
             config.validate()

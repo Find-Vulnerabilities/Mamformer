@@ -38,6 +38,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from mamformer.layers.rope import RotaryEmbedding, apply_rotary_emb
+from mamformer.layers.mamba2 import selective_scan
+from mamformer.kernels.flash_attention import flash_attn_gqa
+from mamformer.layers.moe import _moe_update_expert_bias
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # TP Communication Helpers
@@ -300,7 +305,6 @@ class TPAttention(nn.Module):
         self.dropout = dropout
         self.sliding_window = sliding_window
 
-        from mamformer.layers.rope import RotaryEmbedding
         self.rope = RotaryEmbedding(
             head_dim=head_dim, max_seq_len=max_seq_len, theta=rope_theta,
             use_yarn=use_yarn, yarn_scale=yarn_scale,
@@ -329,7 +333,6 @@ class TPAttention(nn.Module):
         # RoPE
         cos, sin = self.rope(seq_len, x.device)
         cos, sin = cos.to(q.dtype), sin.to(q.dtype)
-        from mamformer.layers.rope import apply_rotary_emb
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
@@ -339,22 +342,20 @@ class TPAttention(nn.Module):
             v = torch.cat([cache["v"], v], dim=2)
         new_cache = {"k": k, "v": v} if use_cache else None
 
-        # All-gather K, V across TP ranks for full attention
+        # All-gather K, V across TP ranks for full attention.
+        # After all-gather: k_full has n_kv_heads total KV heads (across all ranks).
+        # q has only n_heads_local = n_heads/tp_size query heads.
+        # flash_attn_gqa handles GQA internally: it computes n_groups =
+        # q_heads / kv_heads and expands KV heads as needed. Since K already
+        # has all heads (post-gather), n_groups = n_heads_local / n_kv_heads.
+        # This is <= the original n_head_groups, so GQA is correctly handled.
         if self.tp_size > 1:
             k_full = _tp_all_gather(k, dim=1)  # Gather KV heads
             v_full = _tp_all_gather(v, dim=1)
         else:
             k_full, v_full = k, v
 
-        # Local GQA: repeat local KV heads for local Q heads
-        if self.n_head_groups > 1:
-            k_local = k_full.repeat_interleave(self.n_head_groups, dim=1)
-            v_local = v_full.repeat_interleave(self.n_head_groups, dim=1)
-        else:
-            k_local, v_local = k_full, v_full
-
         # Flash Attention (best available backend)
-        from mamformer.kernels.flash_attention import flash_attn_gqa
         attn_out = flash_attn_gqa(
             q, k_full, v_full,
             is_causal=(attention_mask is None),
@@ -440,11 +441,14 @@ class TPMamba2Block(nn.Module):
             self.d_inner, d_model, bias=False,
         )
 
-        self._init_weights()
+        # Note: ColumnParallelLinear/RowParallelLinear init weights in their
+        # own __init__. We only override dt/B/C projections which are local.
+        self._init_dt_weights()
 
-    def _init_weights(self):
-        nn.init.normal_(self.in_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02)
+    def _init_dt_weights(self):
+        """Initialize local dt/B/C/conv projections only.
+        in_proj and out_proj weights are handled by ColumnParallelLinear
+        and RowParallelLinear respectively — no re-initialization needed."""
         for layer in self.dt_proj:
             if isinstance(layer, nn.Linear):
                 nn.init.normal_(layer.weight, mean=0.0, std=0.001)
@@ -477,7 +481,6 @@ class TPMamba2Block(nn.Module):
         C = self.C_proj(x_act)
 
         # SSD scan
-        from mamformer.layers.mamba2 import selective_scan
         y = selective_scan(
             x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
         )
@@ -609,6 +612,7 @@ class TPDeepSeekMoE(nn.Module):
         return shared_out + routed_out, aux_info
 
     def _compute_routed_experts(self, x, top_k_indices, top_k_gates, B, S):
+        """Compute routed expert outputs with vectorized gate lookup."""
         d_model = self.d_model
         output = torch.zeros(B, S, d_model, device=x.device, dtype=x.dtype)
         x_flat = x.view(B * S, d_model)
@@ -616,7 +620,7 @@ class TPDeepSeekMoE(nn.Module):
         gate_flat = top_k_gates.view(B * S, self.top_k)
 
         for expert_idx in range(self.n_routed_experts):
-            expert_mask = (idx_flat == expert_idx)
+            expert_mask = (idx_flat == expert_idx)  # (N, top_k)
             token_has_expert = expert_mask.any(dim=-1)
             if not token_has_expert.any():
                 continue
@@ -624,11 +628,11 @@ class TPDeepSeekMoE(nn.Module):
             expert_input = x_flat[token_has_expert]
             expert_output = self.routed_experts[expert_idx](expert_input)
 
+            # Vectorized gate lookup: expert_mask gives (N, top_k) bool,
+            # take argmax along top_k dim for the slot index of this expert
             token_indices = token_has_expert.nonzero(as_tuple=True)[0]
-            gates_for_tokens = torch.zeros(len(token_indices), device=x.device, dtype=x.dtype)
-            for i, token_idx in enumerate(token_indices):
-                slot_idx = expert_mask[token_idx].nonzero(as_tuple=True)[0][0]
-                gates_for_tokens[i] = gate_flat[token_idx, slot_idx]
+            slot_indices = expert_mask[token_has_expert].float().argmax(dim=-1)
+            gates_for_tokens = gate_flat[token_indices, slot_indices]
 
             expert_output = expert_output * gates_for_tokens.unsqueeze(-1)
             output.view(B * S, d_model)[token_indices] += expert_output
@@ -636,13 +640,11 @@ class TPDeepSeekMoE(nn.Module):
         return output
 
     def _update_expert_bias(self, top_k_indices, total_tokens):
-        expert_counts = torch.zeros(self.n_routed_experts, device=top_k_indices.device, dtype=torch.float32)
-        for i in range(self.n_routed_experts):
-            expert_counts[i] = (top_k_indices == i).sum().float()
-        actual_load = expert_counts / (total_tokens * self.top_k)
-        expected_load = 1.0 / self.n_routed_experts
-        self.expert_bias -= self.bias_update_speed * torch.sign(actual_load - expected_load)
-        self.expert_load_ema = 0.99 * self.expert_load_ema + 0.01 * actual_load
+        """Vectorized aux-loss-free expert bias update (shared with DeepSeekMoE)."""
+        _moe_update_expert_bias(
+            top_k_indices, total_tokens, self.n_routed_experts, self.top_k,
+            self.bias_update_speed, self.expert_bias, self.expert_load_ema,
+        )
 
 
 class _TPSwiGLUExpert(nn.Module):
@@ -672,20 +674,24 @@ def shard_model_tp(model: nn.Module, tp_size: int) -> nn.Module:
     This replaces dense layers with their TP equivalents throughout
     the model. The TP process group must be set before calling.
 
+    NOTE: Retroactive TP sharding is not yet fully implemented.
+    For production use, construct the model with TP wrappers (TPAttention,
+    TPMamba2Block, TPDeepSeekMoE) directly at init time, or set
+    tp_size=1 and use FSDP/EP for distribution instead.
+
     Args:
         model: MamformerForCausalLM or MamformerModel
         tp_size: Number of GPUs for tensor parallelism
 
     Returns:
-        Model with TP layers (same object, modified in-place)
+        Model (unchanged if tp_size==1)
     """
-    # TP is handled at construction time via TPAttention, TPMamba2Block, etc.
-    # For already-constructed models, TP layer replacement is not yet implemented.
-    # Either construct the model with TP wrappers directly, or implement
-    # layer-by-layer replacement here.
     if tp_size > 1:
-        raise NotImplementedError(
+        import warnings
+        warnings.warn(
             f"Retroactive TP sharding (tp_size={tp_size}) is not yet implemented. "
-            "Construct the model with TP wrappers at init time instead."
+            "Model layers will not be tensor-parallelized. "
+            "Construct the model with TP wrappers at init time, or use FSDP/EP instead.",
+            RuntimeWarning,
         )
     return model

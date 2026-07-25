@@ -42,15 +42,21 @@ dev = [
     "ruff>=0.1.0",
 ]
 all = [
-    "Mamformer[train,dev]",
+    "datasets>=2.14.0",
+    "accelerate>=0.24.0",
+    "wandb>=0.15.0",
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0",
+    "ruff>=0.1.0",
 ]
 
 [project.scripts]
-Mamformer-generate = "Mamformer.cli:generate"
-Mamformer-train = "Mamformer.cli:train"
+Mamformer-generate = "mamformer.scripts.generate:main"
+Mamformer-train = "mamformer.scripts.train:main"
 
 [tool.setuptools.packages.find]
-include = ["Mamformer*"]
+include = ["mamformer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

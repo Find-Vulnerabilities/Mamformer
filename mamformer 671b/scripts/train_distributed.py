@@ -76,17 +76,32 @@ class StreamingTextDataset(torch.utils.data.IterableDataset):
             yield {"input_ids": tokens[:-1], "labels": tokens[1:]}
 
     def _file_iter(self):
+        """Stream from pre-tokenized files with direct tensor chunking (no OOM)."""
         import random
         random.seed(self.seed)
-        buffer = []
+        carry_over: list[int] = []  # Small carry-over buffer (max seq_len ints)
         for fp in self.files:
             raw_bytes = open(fp, 'rb').read()
             data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
-            buffer.extend(data.tolist())
-            while len(buffer) >= self.seq_len + 1:
-                chunk = buffer[:self.seq_len + 1]
-                buffer = buffer[self.seq_len:]
-                yield {"input_ids": torch.tensor(chunk[:-1]), "labels": torch.tensor(chunk[1:])}
+            # Stream directly from tensor — no full .tolist() conversion
+            pos = 0
+            n = data.shape[0]
+            # Prepend carry-over from previous file
+            if carry_over:
+                carry_tensor = torch.tensor(carry_over, dtype=torch.long)
+                data = torch.cat([carry_tensor, data], dim=0)
+                carry_over = []
+                n = data.shape[0]
+            while pos + self.seq_len + 1 <= n:
+                chunk = data[pos:pos + self.seq_len + 1]
+                pos += self.seq_len
+                yield {
+                    "input_ids": chunk[:-1].clone(),
+                    "labels": chunk[1:].clone(),
+                }
+            # Carry-over: keep at most seq_len tokens
+            if pos < n:
+                carry_over = data[pos:].tolist()[-self.seq_len:]
 
 
 # ═══════════════════════════════════════════════════════════════════════

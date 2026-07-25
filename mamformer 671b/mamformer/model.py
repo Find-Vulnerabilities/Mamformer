@@ -7,14 +7,33 @@ Top-level model classes for the Mamformer architecture.
 - MamformerForCausalLM: MamformerModel + LM head + optional MTP → logits + loss
 
 Ultra features:
-  - DeepSeekMoE: Sparse mixture of experts for massive capacity (50B+ total, 7B active)
-  - DSA: Differential State-Aware Attention for noise-cancelling
+  - DeepSeekMoE: Sparse mixture of experts for massive capacity
+  - KDA-Diff: Kernelized differential attention with interleaving
   - MTP: Multi-Token Prediction for denser training signal
+
+─── THINKING / REFLECTION ────────────────────────────────────────────
+This file provides token-based multi-path parallel thinking (the primary
+mechanism). Two other thinking/reflection systems exist in the codebase:
+
+  1. model.py (THIS FILE): Token-based multi-path parallel thinking
+     - ThinkingConfig + control tokens (IDs 3-7)
+     - N parallel reasoning paths → summary synthesis → answer
+     - Most feature-complete; preferred for new development
+
+  2. chat.py: Language-level reflection via XML tags
+     - think/critique modes using <thinking>/<draft>/<critique> tags
+     - Prompt-level only — no architecture changes needed
+
+  3. reflection.py: MLP-based ReflectionModule
+     - Trainable parameters for critique + refinement
+     - Attached via add_reflection_to_model()
+
+See mamformer.chat and mamformer.reflection for the other two systems.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -392,6 +411,61 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
                 embedding_weight=self.model.embed_tokens.weight if config.tie_word_embeddings else None,
             )
 
+        # ── Track if embeddings have been extended for thinking tokens ──
+        self._embeddings_extended: bool = False
+
+    def _extend_embeddings(self, new_vocab_size: int) -> None:
+        """
+        Extend token embeddings and LM head to accommodate new tokens
+        (e.g., thinking control tokens). Initializes new rows with the
+        mean of existing embeddings so they start with reasonable values.
+
+        This is a minimal structural change — no retraining required.
+
+        Args:
+            new_vocab_size: Target vocabulary size (must be > current)
+        """
+        current_vocab = self.config.vocab_size
+        if new_vocab_size <= current_vocab:
+            return  # Already large enough
+
+        n_new = new_vocab_size - current_vocab
+        d_model = self.config.d_model
+
+        # ── Extend embed_tokens ────────────────────────────────────
+        old_embed = self.model.embed_tokens.weight.data  # (old_vocab, d_model)
+        old_mean = old_embed.mean(dim=0, keepdim=True)
+        new_embed_rows = old_mean.repeat(n_new, 1) + torch.randn(
+            n_new, d_model, device=old_embed.device, dtype=old_embed.dtype
+        ) * 0.02
+        new_embed = torch.cat([old_embed, new_embed_rows], dim=0)
+        self.model.embed_tokens = nn.Embedding(new_vocab_size, d_model)
+        self.model.embed_tokens.weight.data.copy_(new_embed)
+
+        # ── Extend lm_head if not tied ─────────────────────────────
+        if self.lm_head is not None:
+            old_head = self.lm_head.weight.data  # (old_vocab, d_model)
+            new_head_rows = old_mean.repeat(n_new, 1) + torch.randn(
+                n_new, d_model, device=old_head.device, dtype=old_head.dtype
+            ) * 0.02
+            new_head = torch.cat([old_head, new_head_rows], dim=0)
+            self.lm_head = nn.Linear(d_model, new_vocab_size, bias=False)
+            self.lm_head.weight.data.copy_(new_head)
+
+        # ── Update config ──────────────────────────────────────────
+        self.config.vocab_size = new_vocab_size
+        self._embeddings_extended = True
+
+    def _ensure_thinking_tokens(self) -> None:
+        """
+        Ensure the model's embedding matrix can represent thinking control tokens.
+        Extends embeddings if vocab_size < summary_start_token_id + 1.
+        """
+        from mamformer.tokenizer import MamformerTokenizer
+        min_vocab = MamformerTokenizer.SUMMARY_START_ID + 1  # token IDs 0-7
+        if self.config.vocab_size < min_vocab:
+            self._extend_embeddings(min_vocab)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -493,9 +567,14 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
         top_p: Optional[float] = None,
         eos_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
-    ) -> torch.Tensor:
+        thinking_config: Optional[object] = None,
+    ) -> Union[torch.Tensor, dict]:
         """
         Autoregressive text generation with config-driven defaults.
+
+        Supports toggleable thinking mode: when thinking_config is
+        provided and enabled, the model first generates internal
+        reasoning tokens before producing the final answer.
 
         If parameters are None, defaults are taken from config.generation.
         This allows each model tier to have appropriate default generation settings.
@@ -508,11 +587,40 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
             top_p: Nucleus threshold (default: from config.generation)
             eos_token_id: Stop generation when this token is produced
             pad_token_id: Token ID for padding
+            thinking_config: Optional ThinkingConfig for toggleable reasoning mode.
+                           When enabled, returns a dict with separated thinking/answer tokens.
+                           When None/disabled, returns a tensor (backward compatible).
 
         Returns:
-            Generated token IDs (batch, prompt_len + generated_len)
+            - Tensor (batch, prompt_len + generated_len) when thinking is disabled
+            - Dict with keys when thinking is enabled:
+                "generated_ids": full sequence with thinking markers
+                "thinking_ids": thinking/reasoning tokens only
+                "answer_ids": answer tokens only
+                "thinking_config": snapshot of the thinking config used
         """
-        # Apply config-driven defaults
+        # ── Determine if thinking mode is active ──────────────────
+        use_thinking = (
+            thinking_config is not None
+            and getattr(thinking_config, 'enabled', False)
+            and getattr(thinking_config, 'is_active', False)
+        )
+
+        if use_thinking:
+            # Ensure model embeddings can represent thinking tokens
+            self._ensure_thinking_tokens()
+            return self._generate_with_thinking(
+                input_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+                pad_token_id=pad_token_id,
+                thinking_config=thinking_config,
+            )
+
+        # ── Standard generation (original path) ──────────────────
         gen_cfg = self.config.generation
         if max_new_tokens is None:
             max_new_tokens = gen_cfg.max_output_tokens
@@ -548,7 +656,7 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
             logits = outputs["logits"][:, -1, :]  # (batch, vocab_size)
             cache = outputs.get("cache")
 
-            # Repetition penalty: penalize already-generated tokens
+            # Repetition penalty
             if rep_penalty != 1.0:
                 for i in range(batch_size):
                     for token_id in set(generated[i].tolist()):
@@ -557,36 +665,16 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
                         else:
                             logits[i, token_id] *= rep_penalty
 
-            # Temperature scaling
-            if temperature > 0 and temperature != 1.0:
-                logits = logits / temperature
+            # Sample next token
+            next_token = self._sample_from_logits(
+                logits, temperature, top_k, top_p
+            )
 
-            # Top-k filtering
-            if top_k > 0:
-                k = min(top_k, logits.size(-1))
-                top_k_values, _ = torch.topk(logits, k, dim=-1)
-                logits = logits.masked_fill(logits < top_k_values[:, -1:], torch.finfo(logits.dtype).min)
-
-            # Top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_mask = cumulative_probs > top_p
-                sorted_mask[:, 1:] = sorted_mask[:, :-1].clone()
-                sorted_mask[:, 0] = False
-                mask = sorted_mask.scatter(1, sorted_indices, sorted_mask)
-                logits = logits.masked_fill(mask, torch.finfo(logits.dtype).min)
-
-            # Sample or greedy
-            if temperature <= 0:
-                next_token = logits.argmax(dim=-1, keepdim=True)
-            else:
-                probs = F.softmax(logits, dim=-1)
-                probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
-                next_token = torch.multinomial(probs, num_samples=1)
-
-            # Mask finished sequences (keep generating pad for uniformity)
-            next_token = next_token.masked_fill(~unfinished.unsqueeze(-1), pad_token_id if pad_token_id is not None else 0)
+            # Mask finished sequences
+            next_token = next_token.masked_fill(
+                ~unfinished.unsqueeze(-1),
+                pad_token_id if pad_token_id is not None else 0,
+            )
 
             generated = torch.cat([generated, next_token], dim=-1)
 
@@ -596,11 +684,328 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
 
         return generated
 
+    @torch.no_grad()
+    def _expand_cache_batch(self, cache: Optional[List[dict]], n: int) -> Optional[List[dict]]:
+        """Expand cache batch dimension from 1 to n for parallel path generation."""
+        if cache is None:
+            return None
+        expanded = []
+        for layer_cache in cache:
+            if layer_cache is None:
+                expanded.append(None)
+                continue
+            layer_exp = {}
+            for key, val in layer_cache.items():
+                if isinstance(val, torch.Tensor) and val.shape[0] == 1:
+                    layer_exp[key] = val.expand(n, *val.shape[1:]).clone()
+                elif isinstance(val, dict):
+                    layer_exp[key] = {
+                        k: v.expand(n, *v.shape[1:]).clone() if isinstance(v, torch.Tensor) and v.shape[0] == 1 else v
+                        for k, v in val.items()
+                    }
+                else:
+                    layer_exp[key] = val
+            expanded.append(layer_exp)
+        return expanded
+
+    def _generate_thinking_paths_batched(
+        self,
+        prompt_cache: List[dict],
+        base_sequence: torch.Tensor,
+        think_start_id: int,
+        think_end_id: int,
+        think_budget: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        rep_penalty: float,
+        num_paths: int,
+        device: torch.device,
+    ) -> tuple[List[List[int]], torch.Tensor]:
+        """
+        Generate N independent thinking paths simultaneously (batched).
+
+        All paths branch from the same prompt KV cache (expanded to batch=N).
+        Paths are isolated via cloned caches — they don't see each other.
+        Generation is step-interleaved: token 1 for all paths, token 2 for all, etc.
+
+        Returns:
+            (all_path_tokens, full_sequence_with_all_paths)
+        """
+        # Expand prompt cache from batch=1 to batch=num_paths
+        path_caches = self._expand_cache_batch(prompt_cache, num_paths)
+
+        # Track per-path state
+        path_tokens: List[List[int]] = [[] for _ in range(num_paths)]
+        path_done = [False] * num_paths
+        path_hit_think_end = [False] * num_paths
+        n_done = 0
+
+        # Each path gets its own sequence starting from base, but we batch
+        # the generation step-by-step
+        # Start: inject <|think_start|> for all paths
+        think_start_tensor = torch.full((num_paths, 1), think_start_id, dtype=torch.long, device=device)
+
+        # Step-interleaved generation: one token per active path per step
+        for step in range(think_budget):
+            if n_done >= num_paths:
+                break
+
+            # Forward all paths together
+            if step == 0:
+                current_input = think_start_tensor
+            else:
+                current_input = torch.tensor(
+                    [[path_tokens[p][-1]] for p in range(num_paths)],
+                    dtype=torch.long, device=device,
+                )
+
+            outputs = self.forward(
+                input_ids=current_input,
+                use_cache=True,
+                cache=path_caches,
+            )
+            logits = outputs["logits"][:, -1, :]  # (num_paths, vocab)
+            path_caches = outputs.get("cache")
+
+            # Repetition penalty per path
+            if rep_penalty != 1.0:
+                for p in range(num_paths):
+                    if path_done[p]:
+                        continue
+                    seen = set(path_tokens[p])
+                    for tid in seen:
+                        if logits[p, tid] > 0:
+                            logits[p, tid] /= rep_penalty
+                        else:
+                            logits[p, tid] *= rep_penalty
+
+            # Sample one token for each path
+            next_tokens = self._sample_from_logits(logits, temperature, top_k, top_p)  # (N, 1)
+
+            for p in range(num_paths):
+                if path_done[p]:
+                    continue
+                tid = next_tokens[p, 0].item()
+                path_tokens[p].append(tid)
+
+                if tid == think_end_id:
+                    path_hit_think_end[p] = True
+                    path_done[p] = True
+                    n_done += 1
+                elif step >= think_budget - 1:
+                    # Budget exceeded for all remaining
+                    path_done[p] = True
+                    n_done += 1
+
+        # Budget forcing: inject think_end for paths that didn't emit it
+        for p in range(num_paths):
+            if not path_hit_think_end[p]:
+                path_tokens[p].append(think_end_id)
+
+        # Build full sequence: prompt + [path_1 + path_2 + ... + path_N]
+        full_seq = base_sequence.clone()
+        for p in range(num_paths):
+            # Add <|think_start|> + path tokens
+            full_seq = torch.cat([
+                full_seq,
+                torch.tensor([[think_start_id]], dtype=torch.long, device=device),
+                torch.tensor([path_tokens[p]], dtype=torch.long, device=device),
+            ], dim=-1)
+
+        return path_tokens, full_seq
+
+    @torch.no_grad()
+    def _generate_with_thinking(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: Optional[int],
+        temperature: Optional[float],
+        top_k: Optional[int],
+        top_p: Optional[float],
+        eos_token_id: Optional[int],
+        pad_token_id: Optional[int],
+        thinking_config: object,
+    ) -> dict:
+        """
+        Multi-path parallel thinking with batched generation.
+
+        Phases:
+          1. Prompt: forward, save KV cache
+          2. Paths: N paths generated simultaneously (batched step-interleaved)
+          3. Summary: synthesize across all paths
+          4. Answer: final answer
+
+        Paths are generated batched — all paths advance one token per step,
+        sharing a single forward pass. This is ~N times faster than sequential.
+        """
+        from mamformer.thinking import MultiPathController
+
+        gen_cfg = self.config.generation
+        if max_new_tokens is None:
+            max_new_tokens = gen_cfg.max_output_tokens
+        if temperature is None:
+            temperature = gen_cfg.default_temperature
+        if top_k is None:
+            top_k = gen_cfg.default_top_k
+        if top_p is None:
+            top_p = gen_cfg.default_top_p
+
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        rep_penalty = gen_cfg.repetition_penalty
+        think_budget = thinking_config.effective_budget
+        summary_budget = thinking_config.effective_summary_budget
+        num_paths = thinking_config.effective_num_paths
+        think_start_id = thinking_config.think_start_token_id
+        think_end_id = thinking_config.think_end_token_id
+        summary_start_id = thinking_config.summary_start_token_id
+        answer_start_id = thinking_config.answer_start_token_id
+
+        controller = MultiPathController(thinking_config)
+
+        # ── Phase 1: Encode prompt ───────────────────────────────
+        generated = input_ids.clone()
+        outputs = self.forward(input_ids=generated, use_cache=True, cache=None)
+        prompt_cache = outputs.get("cache")
+
+        # ── Phase 2: Batched parallel path generation ─────────────
+        all_path_tokens, generated = self._generate_thinking_paths_batched(
+            prompt_cache=prompt_cache,
+            base_sequence=generated,
+            think_start_id=think_start_id,
+            think_end_id=think_end_id,
+            think_budget=think_budget,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            rep_penalty=rep_penalty,
+            num_paths=num_paths,
+            device=device,
+        )
+
+        total_think_tokens = sum(len(t) for t in all_path_tokens)
+        for p in range(num_paths):
+            controller.start_path(p)
+            for tid in all_path_tokens[p]:
+                controller.record_path_token(p, tid)
+
+        # ── Phase 3: Summary ─────────────────────────────────────
+        summary_start = torch.full((batch_size, 1), summary_start_id, dtype=torch.long, device=device)
+        generated = torch.cat([generated, summary_start], dim=-1)
+        controller.start_summary()
+
+        # Forward through all path tokens to build context, then generate summary
+        # Re-forward the last portion to get cache for summary
+        recent = generated[:, -(num_paths * 2 + 1):] if generated.shape[1] > num_paths * 2 else generated
+        outputs = self.forward(input_ids=recent, use_cache=True, cache=prompt_cache)
+        cache = outputs.get("cache")
+
+        for _ in range(summary_budget):
+            current_input = generated[:, -1:]
+            outputs = self.forward(input_ids=current_input, use_cache=True, cache=cache)
+            logits = outputs["logits"][:, -1, :]
+            cache = outputs.get("cache")
+
+            if rep_penalty != 1.0:
+                for i in range(batch_size):
+                    for tid in set(generated[i].tolist()):
+                        if logits[i, tid] > 0:
+                            logits[i, tid] /= rep_penalty
+                        else:
+                            logits[i, tid] *= rep_penalty
+
+            next_token = self._sample_from_logits(logits, temperature, top_k, top_p)
+            token_id = next_token[0, 0].item()
+            event = controller.record_summary_token(token_id)
+            generated = torch.cat([generated, next_token], dim=-1)
+            if event == "end_summary":
+                break
+
+        # ── Phase 4: Answer ──────────────────────────────────────
+        answer_start = torch.full((batch_size, 1), answer_start_id, dtype=torch.long, device=device)
+        generated = torch.cat([generated, answer_start], dim=-1)
+        controller.start_answer()
+
+        marker_overhead = num_paths * 2 + 3  # think_start/end per path + summary + answer
+        remaining = max_new_tokens - total_think_tokens - summary_budget - marker_overhead
+        unfinished = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+        for _ in range(max(remaining, 1)):
+            if not unfinished.any():
+                break
+            current_input = generated[:, -1:]
+            outputs = self.forward(input_ids=current_input, use_cache=True, cache=cache)
+            logits = outputs["logits"][:, -1, :]
+            cache = outputs.get("cache")
+
+            if rep_penalty != 1.0:
+                for i in range(batch_size):
+                    for tid in set(generated[i].tolist()):
+                        if logits[i, tid] > 0:
+                            logits[i, tid] /= rep_penalty
+                        else:
+                            logits[i, tid] *= rep_penalty
+
+            next_token = self._sample_from_logits(logits, temperature, top_k, top_p)
+            token_id = next_token[0, 0].item()
+            event = controller.record_answer_token(token_id)
+            next_token = next_token.masked_fill(~unfinished.unsqueeze(-1), pad_token_id if pad_token_id is not None else 0)
+            generated = torch.cat([generated, next_token], dim=-1)
+            if eos_token_id is not None:
+                unfinished = unfinished & (next_token.squeeze(-1) != eos_token_id)
+            if event == "end_answer":
+                break
+
+        # ── Finalize ─────────────────────────────────────────────
+        info = controller.finalize()
+        all_paths_tensors = [
+            torch.tensor([tokens], dtype=torch.long, device=device)
+            for tokens in info["all_paths"]
+        ]
+        summary_tensor = torch.tensor([info["summary_tokens"]], dtype=torch.long, device=device)
+        answer_tensor = torch.tensor([info["answer_tokens"]], dtype=torch.long, device=device)
+
+        return {
+            "generated_ids": generated,
+            "all_paths": all_paths_tensors,
+            "path_counts": info["path_counts"],
+            "summary_ids": summary_tensor,
+            "answer_ids": answer_tensor,
+            "total_think_tokens": info["total_think_tokens"],
+            "num_paths": num_paths,
+            "budget_forced": any(info["path_budget_forced"]),
+        }
+
+    def _sample_from_logits(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+    ) -> torch.Tensor:
+        """
+        Sample a single token from logits with temperature, top-k, top-p.
+        Delegates to the shared sampling utility.
+
+        Args:
+            logits: (batch, vocab_size)
+            temperature: Sampling temperature (>0 for sampling, <=0 for greedy)
+            top_k: Top-k filter (>0 to enable)
+            top_p: Nucleus threshold (<1.0 to enable)
+
+        Returns:
+            (batch, 1) token indices
+        """
+        from mamformer.sampling import sample_one_token
+        return sample_one_token(logits, temperature=temperature, top_k=top_k, top_p=top_p)
+
     def get_log_probs(
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        token_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute per-token log probabilities. Used by GRPO training.
@@ -608,10 +1013,15 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
         Returns average log-probability over non-masked response tokens.
         If labels is None, returns log-probs for all tokens (for generation scoring).
 
+        Supports S-GRPO sparse token sampling via token_mask.
+
         Args:
             input_ids: Token indices (batch, seqlen)
             labels: Target labels, -100 for ignored positions
             attention_mask: Optional attention mask
+            token_mask: Optional (batch, seqlen-1) bool mask for S-GRPO.
+                       True = include this token in the average.
+                       When None, all response tokens are included.
 
         Returns:
             If labels provided: (batch,) average log-prob per response token
@@ -644,6 +1054,11 @@ class MamformerForCausalLM(GenerationMixin, nn.Module):
             # Mask: only consider response tokens
             shift_labels = labels[:, 1:].contiguous()  # (batch, seqlen-1)
             response_mask = (shift_labels != -100).float()  # (batch, seqlen-1)
+
+            # Apply S-GRPO token mask if provided
+            if token_mask is not None:
+                response_mask = response_mask * token_mask.float()
+
             total_tokens = response_mask.sum(dim=1).clamp(min=1)  # (batch,)
             avg_log_probs = (token_log_probs * response_mask).sum(dim=1) / total_tokens
             return avg_log_probs  # (batch,)

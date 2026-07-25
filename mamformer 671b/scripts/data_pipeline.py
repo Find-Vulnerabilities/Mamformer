@@ -332,8 +332,27 @@ class Deduplicator:
     def _minhash_signature(self, text: str) -> List[int]:
         """Compute MinHash signature for a document."""
         words = text.lower().split()
+
+        # For short documents, use character-level n-grams to ensure enough
+        # diversity for meaningful MinHash computation. Avoids the degenerate
+        # case where a single hash × N produces uniform band hashes and
+        # false-positive deduplication via LSH bucketing.
         if len(words) < 20:
-            return [int(hashlib.sha256(text.encode()).hexdigest()[:8], 16)] * self.num_hashes
+            # Use character trigrams + positional hashing
+            text_clean = text.lower()
+            sig = [2**32 - 1] * self.num_hashes
+            for i in range(len(text_clean) - 2):
+                trigram = text_clean[i:i + 3]
+                for j in range(self.num_hashes):
+                    h = int(hashlib.sha256(f"short:{j}:{trigram}".encode()).hexdigest()[:8], 16)
+                    if h < sig[j]:
+                        sig[j] = h
+            # Fallback if even trigrams are insufficient (very short text)
+            if sig[0] == 2**32 - 1:
+                for j in range(self.num_hashes):
+                    h = int(hashlib.sha256(f"fallback:{j}:{text}".encode()).hexdigest()[:8], 16)
+                    sig[j] = h
+            return sig
 
         # Simple MinHash: use n-grams with multiple hash functions
         n = 5
@@ -638,8 +657,9 @@ class MultiFormatReader:
                             text = self._extract_text_from_obj(item)
                             if text:
                                 yield text, "json"
+                        return  # Successfully processed JSON array — done
                 except json.JSONDecodeError:
-                    f.seek(0)
+                    f.seek(0)  # Not valid JSON array, fall through to JSONL
 
             # JSONL (one object per line)
             for line in f:
@@ -718,7 +738,16 @@ class MultiFormatReader:
         text = re.sub(r'^[-*+]\s+', '', text, flags=re.MULTILINE)
         text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
         text = re.sub(r'^>\s+', '', text, flags=re.MULTILINE)
-        text = re.sub(r'\|.*?\|', '', text)  # Tables
+        # Remove Markdown tables (only outside code blocks to avoid
+        # damaging pipe characters in code like `x | y` or `a || b`).
+        # Split on code fences, clean non-code segments, reassemble.
+        code_blocks = re.split(r'(```[^`]*```)', text)
+        cleaned = []
+        for i, segment in enumerate(code_blocks):
+            if i % 2 == 0:  # Non-code segment
+                segment = re.sub(r'\|.*?\|', '', segment)  # Tables
+            cleaned.append(segment)
+        text = ''.join(cleaned)
         text = re.sub(r'[-*_]{3,}', '', text)  # Horizontal rules
         text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()

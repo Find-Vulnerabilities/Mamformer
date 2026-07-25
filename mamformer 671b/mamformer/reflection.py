@@ -13,18 +13,26 @@ This implements a form of "test-time compute" — the model can
 spend extra computation to improve output quality through
 self-critique and revision.
 
-Two modes:
-  - Fast: standard generation (no reflection)
-  - Reflect: generate → critique → refine (1 extra forward pass)
+─── THINKING / REFLECTION ────────────────────────────────────────────
+Mamformer has THREE independent thinking/reflection mechanisms:
 
-Training:
-  - During SFT, add reflection loss on top of standard LM loss
-  - Model learns to generate useful critiques and improvements
+  1. reflection.py (THIS FILE): MLP-based ReflectionModule
+     - Trainable parameters for critique generation + hidden state refinement
+     - Confidence scoring for whether refinement actually helped
+     - Attached via add_reflection_to_model()
+
+  2. model.py: Token-based multi-path parallel thinking
+     - ThinkingConfig + control tokens (IDs 3-7)
+     - N parallel reasoning paths → summary → answer
+     - Preferred for new development (most feature-complete)
+
+  3. chat.py: Language-level reflection via XML tags
+     - think/critique modes: <thinking>/<draft>/<critique> XML tags
+     - Prompt-level only — no architecture changes needed
 
 Reference:
   "Self-Refine: Iterative Refinement with Self-Feedback" (Madaan et al., 2023)
   "Constitutional AI: Harmlessness from AI Feedback" (Bai et al., 2022)
-  "Chain-of-Thought Prompting Elicits Reasoning" (Wei et al., 2022)
 """
 
 from __future__ import annotations
@@ -234,8 +242,8 @@ class ReflectionModule(nn.Module):
             # Mask ignored positions (-100) to avoid biasing the improvement rate
             valid_mask = (shift_labels.view(-1) != -100).float()
             improved = (refined_loss_per_token < original_loss).float() * valid_mask
-            valid_count = valid_mask.view(bs, -1).sum(dim=1).clamp(min=1)
-            improved_per_sample = improved.view(bs, -1).sum(dim=1) / valid_count
+            valid_count = valid_mask.view(batch_size, -1).sum(dim=1).clamp(min=1)
+            improved_per_sample = improved.view(batch_size, -1).sum(dim=1) / valid_count
 
         # Confidence loss: push confidence toward actual per-sample improvement
         conf_loss = F.mse_loss(confidence.squeeze(-1), improved_per_sample)

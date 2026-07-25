@@ -114,55 +114,6 @@ def selective_scan(
     return tuple(result)
 
 
-def selective_scan_sequential(
-    x: torch.Tensor,
-    dt: torch.Tensor,
-    A: torch.Tensor,
-    B: torch.Tensor,
-    C: torch.Tensor,
-    D: torch.Tensor,
-    return_h_states: bool = False,
-):
-    """
-    Sequential selective scan (for testing/validation of the SSD kernel).
-    Numerically equivalent to selective_scan() — O(seqlen), verifies correctness.
-
-    Returns:
-        y: (batch, seqlen, d_inner)
-        h_states: (batch, seqlen, d_state) if return_h_states=True
-    """
-    batch, seqlen, d_inner = x.shape
-    d_state = A.shape[0]
-
-    A_bc = A.view(1, 1, 1, d_state)
-    dt_expanded = dt.unsqueeze(-1)
-    A_disc = torch.exp(-torch.exp(A_bc) * dt_expanded)
-
-    B_expanded = B.unsqueeze(2)
-    B_disc = B_expanded * dt_expanded
-
-    h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
-    y = torch.zeros(batch, seqlen, d_inner, device=x.device, dtype=x.dtype)
-    h_states = torch.zeros(batch, seqlen, d_state, device=x.device, dtype=x.dtype) if return_h_states else None
-
-    for t in range(seqlen):
-        A_t = A_disc[:, t]
-        Bx_t = B_disc[:, t] * x[:, t].unsqueeze(-1)
-        C_t = C[:, t].unsqueeze(1)
-
-        h = A_t * h + Bx_t
-        y[:, t] = (C_t * h).sum(dim=-1)
-        if return_h_states:
-            h_states[:, t] = h.mean(dim=1)
-
-    D_expanded = D.view(1, 1, d_inner)
-    y = y + D_expanded * x
-
-    if return_h_states:
-        return y, h_states
-    return y
-
-
 class Mamba2Block(nn.Module):
     """
     Mamba-2 SSM block for use within the hybrid Mamformer architecture.
@@ -307,39 +258,22 @@ class Mamba2Block(nn.Module):
             y, final_h_state = self._recurrent_step(x_act, dt, B, C, cache["ssm_state"])
 
         elif seqlen > 1 and not return_h_states:
-            # ── Try Triton fused kernel for training (fast path) ──
-            try:
-                from mamformer.kernels.triton_ssd import is_triton_available, triton_selective_scan_fused
-                if is_triton_available():
-                    y = triton_selective_scan_fused(
-                        x_act, self.dt_proj, self.A_log,
-                        self.B_proj, self.C_proj, self.D,
-                    )
-                    if use_cache:
-                        # Fused kernel doesn't return final state — compute from last position
-                        dt_last = F.softplus(self.dt_proj(x_act[:, -1:]))
-                        B_last = self.B_proj(x_act[:, -1:])
-                        x_last = x_act[:, -1:]
-                        A_clamped = torch.clamp(self.A_log, min=-5.0, max=5.0)
-                        A_param = torch.exp(A_clamped)
-                        A_disc_last = torch.exp(-A_param.view(1, 1, 1, self.d_state) * dt_last.unsqueeze(-1))
-                        B_disc_last = B_last.unsqueeze(2) * dt_last.unsqueeze(-1)
-                        final_h_state = (B_disc_last * x_last.unsqueeze(-1))[:, 0]
-                else:
-                    raise ImportError
-            except (ImportError, Exception):
-                # Fallback to staged path
-                dt = F.softplus(self.dt_proj(x_act))
-                B = self.B_proj(x_act)
-                C = self.C_proj(x_act)
-                scan_result = selective_scan(
-                    x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
-                    return_h_states=False, return_final_state=use_cache,
-                )
-                if use_cache:
-                    y, final_h_state = scan_result
-                else:
-                    y = scan_result
+            # ── Staged path: project dt/B/C → selective scan ──
+            # NOTE: The Triton fused kernel (triton_selective_scan_fused) is
+            # disabled by default due to a known architectural issue with
+            # partial-input projections. The staged path uses the correct
+            # PyTorch sequential scan, validated against selective_scan().
+            dt = F.softplus(self.dt_proj(x_act))
+            B = self.B_proj(x_act)
+            C = self.C_proj(x_act)
+            scan_result = selective_scan(
+                x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
+                return_h_states=False, return_final_state=use_cache,
+            )
+            if use_cache:
+                y, final_h_state = scan_result
+            else:
+                y = scan_result
         else:
             # ── Staged path (return_h_states or seqlen==1) ──
             dt = F.softplus(self.dt_proj(x_act))
@@ -371,10 +305,11 @@ class Mamba2Block(nn.Module):
         if use_cache:
             # Use the correctly-computed final h state (from recurrent_step or scan).
             # The scan path always returns final_h_state when return_final_state=True.
-            assert final_h_state is not None, (
-                "selective_scan did not return final_h_state despite return_final_state=True. "
-                "This indicates a bug in the scan function."
-            )
+            if final_h_state is None:
+                raise RuntimeError(
+                    "selective_scan did not return final_h_state despite "
+                    "return_final_state=True. This indicates a bug in the scan function."
+                )
             new_ssm_state = final_h_state
 
             # Compute conv state (last d_conv-1 positions of RAW x before convolution)

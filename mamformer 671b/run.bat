@@ -46,7 +46,7 @@ if %GPU_COUNT% gtr 0 (
 cls
 echo(
 echo  +============================================================+
-echo  ^|        Mamformer One-Click Training v0.3                  ^|
+echo  ^|        Mamformer One-Click Training v0.4                  ^|
 echo  +============================================================+
 echo  ^|  GPU Count: %GPU_COUNT%
 echo  +------------------------------------------------------------+
@@ -55,7 +55,7 @@ echo  ^|   [1] Auto clean + classify (scan data\raw\)               ^|
 echo  ^|   [2] Tokenize -^> .bin (need step 1 first)                ^|
 echo  ^|   [3] Full data pipeline (step 1 + 2, auto)                ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Pretraining (from scratch):                               ^|
+echo  ^|  Pretraining (SFT):                                        ^|
 echo  ^|   [4] Debug test (0.01B) -- 1 GPU, quick verify            ^|
 echo  ^|   [5] 7B Dense -- 1~8 GPU                                  ^|
 echo  ^|   [6] Ultra 7B (39B total / 7.5B active) -- 8 GPU          ^|
@@ -64,14 +64,17 @@ echo  ^|   [8] Ultra 371B (371B / 28B) -- 64 GPU                    ^|
 echo  ^|   [9] Ultra 671B MAX (671B / 37B) -- 64~128 GPU            ^|
 echo  +------------------------------------------------------------+
 echo  ^|  Post-training:                                            ^|
-echo  ^|   [G] GRPO Reasoning RL                                    ^|
+echo  ^|   [G] GRPO Reasoning RL (with S-GRPO option)               ^|
+echo  +------------------------------------------------------------+
+echo  ^|  Inference / Demo:                                         ^|
+echo  ^|   [D] Generate with thinking mode                          ^|
 echo  +------------------------------------------------------------+
 echo  ^|  Other:                                                    ^|
 echo  ^|   [T] Run all tests                                        ^|
 echo  ^|   [Q] Quit                                                 ^|
 echo  +------------------------------------------------------------+
 echo(
-set /p CHOICE="  Select [1-9/G/T/Q]: "
+set /p CHOICE="  Select [1-9/G/D/T/Q]: "
 
 if /i "%CHOICE%"=="1" goto DATA_CLEAN
 if /i "%CHOICE%"=="2" goto DATA_TOKENIZE
@@ -83,6 +86,7 @@ if "%CHOICE%"=="7" goto TRAIN_ULTRA37B
 if "%CHOICE%"=="8" goto TRAIN_ULTRA371B
 if "%CHOICE%"=="9" goto TRAIN_ULTRA671B
 if /i "%CHOICE%"=="G" goto GRPO
+if /i "%CHOICE%"=="D" goto DEMO
 if /i "%CHOICE%"=="T" goto RUN_TESTS
 if /i "%CHOICE%"=="Q" goto END
 goto MAIN_MENU
@@ -148,8 +152,8 @@ if "%FOUND_INPUT%"=="" (
 )
 
 :: Detect format
-echo !FOUND_INPUT! ^| findstr /i "\.jsonl$" ^>nul
-if %errorlevel% equ 0 (
+echo !FOUND_INPUT! | findstr /i "\.jsonl$" >nul
+if !errorlevel! equ 0 (
     set INPUT_TYPE=jsonl
 ) else (
     set INPUT_TYPE=txt
@@ -207,8 +211,8 @@ if "!FOUND_INPUT!"=="" (
     goto MAIN_MENU
 )
 
-echo !FOUND_INPUT! ^| findstr /i "\.jsonl$" ^>nul
-if %errorlevel% equ 0 (set INPUT_TYPE=jsonl) else (set INPUT_TYPE=txt)
+echo !FOUND_INPUT! | findstr /i "\.jsonl$" >nul
+if !errorlevel! equ 0 (set INPUT_TYPE=jsonl) else (set INPUT_TYPE=txt)
 
 python "%PROJECT_DIR%scripts\prepare_data.py" ^
     --input "!FOUND_INPUT!" ^
@@ -404,6 +408,14 @@ if /i "!USE_COMM!"=="y" (
     echo   [OK] CommunicativeMoE enabled
 )
 
+:: Thinking format option (SFT with reasoning tokens)
+set /p USE_THINK="  Train with thinking tokens? [y/N]: "
+set THINK_FLAG=
+if /i "!USE_THINK!"=="y" (
+    set THINK_FLAG=--thinking_format
+    echo   [OK] Thinking format enabled
+)
+
 :: WandB option
 if "%WANDB_FLAG%"=="" (
     set /p USE_WANDB="  Use WandB logging? [y/N]: "
@@ -445,6 +457,7 @@ if %GPU_COUNT% leq 1 (
         --bf16 ^
         !WANDB_FLAG! ^
         !COMM_FLAG! ^
+        !THINK_FLAG! ^
         !RESUME_FLAG!
 ) else (
     :: Multi-GPU FSDP
@@ -464,6 +477,7 @@ if %GPU_COUNT% leq 1 (
         --bf16 ^
         !WANDB_FLAG! ^
         !COMM_FLAG! ^
+        !THINK_FLAG! ^
         !RESUME_FLAG!
 )
 
@@ -539,7 +553,7 @@ goto MAIN_MENU
 :GRPO
 echo(
 echo  +------------------------------------------------------------+
-echo  ^|  GRPO Reasoning RL (DeepSeek-R1 Style)                    ^|
+echo  ^|  GRPO Reasoning RL (+ S-GRPO option)                       ^|
 echo  ^|  Requires SFT checkpoint first                             ^|
 echo  +------------------------------------------------------------+
 echo(
@@ -567,6 +581,29 @@ if "%GRPO_BETA%"=="" set GRPO_BETA=0.04
 set /p GRPO_MAX_STEPS="  Max steps [10000]: "
 if "%GRPO_MAX_STEPS%"=="" set GRPO_MAX_STEPS=10000
 
+:: S-GRPO options
+set /p USE_SGRPO="  Enable S-GRPO (sparse token sampling)? [y/N]: "
+set SGRPO_FLAG=
+set SGRPO_P=0.4
+if /i "!USE_SGRPO!"=="y" (
+    set SGRPO_FLAG=--sgrpo
+    set /p SGRPO_P="    Token sampling probability [0.4]: "
+    if "!SGRPO_P!"=="" set SGRPO_P=0.4
+    set /p SGRPO_ALPHA="    First N tokens always kept [0]: "
+    if "!SGRPO_ALPHA!"=="" set SGRPO_ALPHA=0
+    set /p SGRPO_K="    Max tokens cap (0=disabled) [0]: "
+    if "!SGRPO_K!"=="" set SGRPO_K=0
+    echo   [OK] S-GRPO enabled (p=!SGRPO_P!, alpha=!SGRPO_ALPHA!, k=!SGRPO_K!)
+)
+
+:: Thinking reward option
+set /p USE_THINK_R="  Include thinking quality reward? [y/N]: "
+set THINK_R_FLAG=
+if /i "!USE_THINK_R!"=="y" (
+    set THINK_R_FLAG=--reward_type combined
+    echo   [OK] Thinking quality reward added
+)
+
 echo(
 echo  Launching GRPO training...
 
@@ -585,7 +622,8 @@ if %GPU_COUNT% leq 1 (
         --bf16 ^
         --max_prompt_len 2048 ^
         --gen_max_tokens 1024 ^
-        --output_dir "%GRPO_CHECKPOINT_DIR%"
+        --output_dir "%GRPO_CHECKPOINT_DIR%" ^
+        !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 ) else (
     torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train_grpo.py" ^
         --config "!CONFIG!" ^
@@ -601,7 +639,8 @@ if %GPU_COUNT% leq 1 (
         --bf16 ^
         --max_prompt_len 2048 ^
         --gen_max_tokens 1024 ^
-        --output_dir "%GRPO_CHECKPOINT_DIR%"
+        --output_dir "%GRPO_CHECKPOINT_DIR%" ^
+        !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 )
 
 if %errorlevel% neq 0 (
@@ -610,6 +649,57 @@ if %errorlevel% neq 0 (
     goto MAIN_MENU
 )
 echo [DONE] GRPO training complete!
+pause
+goto MAIN_MENU
+
+:: =====================================================================
+::  DEMO: Generate with Thinking Mode
+:: =====================================================================
+
+:DEMO
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Generate with Thinking Mode                               ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  Available checkpoints:
+if exist "%CHECKPOINT_DIR%\*.pt" (
+    dir /b "%CHECKPOINT_DIR%\*.pt" 2>nul
+) else (
+    echo    (none - using random init)
+)
+echo(
+set /p DEMO_CKPT="  Checkpoint path (or blank for random): "
+set /p DEMO_PROMPT="  Prompt: "
+
+call :SELECT_MODEL_SIZE
+call :SELECT_THINKING_MODE
+
+set /p DEMO_TOKENS="  Max new tokens [256]: "
+if "%DEMO_TOKENS%"=="" set DEMO_TOKENS=256
+
+:: Build thinking args
+set THINK_ARGS=
+if not "%THINK_MODE%"=="NoThink" (
+    set THINK_ARGS=--thinking %THINK_MODE% --think_budget %THINK_BUDGET% --num_paths %THINK_PATHS% --summary_budget %THINK_SUMMARY%
+    set /p SHOW_THINK="  Show thinking tokens? [y/N]: "
+    if /i "!SHOW_THINK!"=="y" set THINK_ARGS=!THINK_ARGS! --show_thinking
+)
+
+set CKPT_ARG=
+if not "%DEMO_CKPT%"=="" set CKPT_ARG=--checkpoint "%DEMO_CKPT%"
+
+echo(
+echo  Generating...
+python "%PROJECT_DIR%scripts\generate.py" ^
+    --config "!CONFIG!" ^
+    --prompt "!DEMO_PROMPT!" ^
+    !CKPT_ARG! ^
+    --max_new_tokens %DEMO_TOKENS% ^
+    --temperature 0.7 ^
+    !THINK_ARGS!
+
+echo(
 pause
 goto MAIN_MENU
 
@@ -659,6 +749,57 @@ if "%CONFIG%"=="debug" (
     set SEQ_LEN=8192
 ) else if "%MODEL_CHOICE%"=="5" (
     set SEQ_LEN=8192
+)
+goto :EOF
+
+:: =====================================================================
+::  HELPER: Select Thinking Mode
+:: =====================================================================
+
+:SELECT_THINKING_MODE
+echo(
+echo   Thinking mode:
+echo     [0] NoThink   - standard generation (no thinking)
+echo     [1] FastThink - 2 paths, 128 tokens each, 64 summary
+echo     [2] CoreThink - 3 paths, 341 tokens each, 128 summary
+echo     [3] DeepThink - 5 paths, 819 tokens each, 256 summary
+echo     [4] Custom
+set /p THINK_CHOICE="   Select [0-4]: "
+
+if "%THINK_CHOICE%"=="0" (
+    set THINK_MODE=NoThink
+    set THINK_BUDGET=0
+    set THINK_PATHS=0
+    set THINK_SUMMARY=0
+) else if "%THINK_CHOICE%"=="1" (
+    set THINK_MODE=FastThink
+    set THINK_BUDGET=128
+    set THINK_PATHS=2
+    set THINK_SUMMARY=64
+) else if "%THINK_CHOICE%"=="2" (
+    set THINK_MODE=CoreThink
+    set THINK_BUDGET=341
+    set THINK_PATHS=3
+    set THINK_SUMMARY=128
+) else if "%THINK_CHOICE%"=="3" (
+    set THINK_MODE=DeepThink
+    set THINK_BUDGET=819
+    set THINK_PATHS=5
+    set THINK_SUMMARY=256
+) else if "%THINK_CHOICE%"=="4" (
+    set /p THINK_MODE="   Mode name [CoreThink]: "
+    if "!THINK_MODE!"=="" set THINK_MODE=CoreThink
+    set /p THINK_BUDGET="   Per-path budget [341]: "
+    if "!THINK_BUDGET!"=="" set THINK_BUDGET=341
+    set /p THINK_PATHS="   Number of paths [3]: "
+    if "!THINK_PATHS!"=="" set THINK_PATHS=3
+    set /p THINK_SUMMARY="   Summary budget [128]: "
+    if "!THINK_SUMMARY!"=="" set THINK_SUMMARY=128
+) else (
+    set THINK_MODE=NoThink
+    set THINK_BUDGET=0
+    set THINK_PATHS=0
+    set THINK_SUMMARY=0
 )
 goto :EOF
 

@@ -112,7 +112,14 @@ def flash_attn_gqa(
 
     training = dropout_p > 0
     if backend == "flash_attn":
-        return _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale, sliding_window)
+        try:
+            return _flash_attn_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale, sliding_window)
+        except NotImplementedError:
+            # flash_attn cannot handle arbitrary masks — fall back to SDPA
+            if hasattr(F, "scaled_dot_product_attention"):
+                return _sdpa_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale)
+            else:
+                return _manual_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale, training=dropout_p > 0)
     elif backend == "sdpa":
         return _sdpa_impl(q, k, v, is_causal, mask, dropout_p, softmax_scale)
     else:
@@ -170,8 +177,9 @@ def _sdpa_impl(q, k, v, is_causal, mask, dropout_p, scale):
     )
 
 
-def _manual_impl(q, k, v, is_causal, mask, dropout_p, scale, training=True):
-    """Manual attention implementation (slow but always available)."""
+def _manual_impl(q, k, v, is_causal, mask, dropout_p, scale, training=False):
+    """Manual attention implementation (slow but always available).
+    training flag should be True only during model training (controls dropout)."""
     attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
 
     dtype_min = torch.finfo(attn_weights.dtype).min

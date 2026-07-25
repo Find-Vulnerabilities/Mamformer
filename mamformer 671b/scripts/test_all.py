@@ -1,6 +1,13 @@
 """
----- - CPU -procs-------
-    torchrun --nproc_per_node=2 scripts/test_all.py
+Mamformer Integration Test Suite
+=================================
+Runs on single or distributed processes. Tests: PyTorch availability,
+model building, forward/backward pass, distributed parallelism
+(EP/TP/PP), training step, and generation.
+
+Usage:
+    python scripts/test_all.py                # Single process
+    torchrun --nproc_per_node=2 scripts/test_all.py   # 2-process distributed
 """
 
 import os, sys, time

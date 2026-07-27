@@ -38,6 +38,10 @@ if %GPU_COUNT% gtr 0 (
     set GPU_COUNT=0
 )
 
+:: BF16 only when GPU available
+set BF16_FLAG=
+if %GPU_COUNT% geq 1 set BF16_FLAG=--bf16
+
 :: =====================================================================
 ::  MAIN MENU
 :: =====================================================================
@@ -441,7 +445,7 @@ echo  Launching training...
 
 if %GPU_COUNT% leq 1 (
     :: Single GPU
-    echo   Mode: Single GPU
+    echo   Mode: CPU
     python "%PROJECT_DIR%scripts\train.py" ^
         --config "%CONFIG%" ^
         --data "%DATA_TOKENIZED%" ^
@@ -454,7 +458,7 @@ if %GPU_COUNT% leq 1 (
         --save_every %SAVE_EVERY% ^
         --log_every %LOG_EVERY% ^
         --output_dir "%CHECKPOINT_DIR%" ^
-        --bf16 ^
+        !BF16_FLAG! ^
         !WANDB_FLAG! ^
         !COMM_FLAG! ^
         !THINK_FLAG! ^
@@ -474,7 +478,7 @@ if %GPU_COUNT% leq 1 (
         --save_every %SAVE_EVERY% ^
         --log_every %LOG_EVERY% ^
         --output_dir "%CHECKPOINT_DIR%" ^
-        --bf16 ^
+        !BF16_FLAG! ^
         !WANDB_FLAG! ^
         !COMM_FLAG! ^
         !THINK_FLAG! ^
@@ -534,7 +538,7 @@ torchrun --nnodes=!NNODES! --nproc_per_node=!NPROC! "%PROJECT_DIR%scripts\train_
     --save_every %SAVE_EVERY% ^
     --log_every %LOG_EVERY% ^
     --output_dir "%CHECKPOINT_DIR%" ^
-    --bf16 ^
+    !BF16_FLAG! ^
     %WANDB_FLAG%
 
 if %errorlevel% neq 0 (
@@ -619,7 +623,7 @@ if %GPU_COUNT% leq 1 (
         --batch_size 4 ^
         --gradient_accumulation_steps 2 ^
         --learning_rate 1e-6 ^
-        --bf16 ^
+        !BF16_FLAG! ^
         --max_prompt_len 2048 ^
         --gen_max_tokens 1024 ^
         --output_dir "%GRPO_CHECKPOINT_DIR%" ^
@@ -636,7 +640,7 @@ if %GPU_COUNT% leq 1 (
         --batch_size 4 ^
         --gradient_accumulation_steps 2 ^
         --learning_rate 1e-6 ^
-        --bf16 ^
+        !BF16_FLAG! ^
         --max_prompt_len 2048 ^
         --gen_max_tokens 1024 ^
         --output_dir "%GRPO_CHECKPOINT_DIR%" ^

@@ -174,7 +174,13 @@ def train(config: dict) -> None:
     logger.info(f"Device: {device}, Distributed: {is_distributed}")
 
     # ── Model ──────────────────────────────────────────────────
-    model_config = MamformerConfig.from_yaml(config["config_path"])
+    cfg_path = config["config_path"]
+    # Support both YAML file paths and preset names (debug, 1b, 300m, etc.)
+    import os as _os
+    if _os.path.isfile(cfg_path):
+        model_config = MamformerConfig.from_yaml(cfg_path)
+    else:
+        model_config = MamformerConfig.from_preset(cfg_path)
 
     # Override CommunicativeMoE from CLI flag
     if config.get("comm_moe", False):

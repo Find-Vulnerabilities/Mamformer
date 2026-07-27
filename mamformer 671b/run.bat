@@ -710,7 +710,7 @@ goto MAIN_MENU
 :RUN_TESTS
 echo(
 echo  Running all tests...
-python -m pytest "%PROJECT_DIR%tests\" -v --tb=short
+python -m pytest "%PROJECT_DIR%tests" -v --tb=short
 echo(
 pause
 goto MAIN_MENU

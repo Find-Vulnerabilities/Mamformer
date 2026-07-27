@@ -59,8 +59,11 @@ echo  ^|   [1] Auto clean + classify (scan data\raw\)               ^|
 echo  ^|   [2] Tokenize -^> .bin (need step 1 first)                ^|
 echo  ^|   [3] Full data pipeline (step 1 + 2, auto)                ^|
 echo  +------------------------------------------------------------+
+echo  ^|  Verify / Debug:                                           ^|
+echo  ^|   [0] Arch Verify (0.1B + all features) -- CPU/1GPU, ~30m  ^|
+echo  ^|   [4] Debug test (0.01B, basic) -- quick pipeline check     ^|
+echo  +------------------------------------------------------------+
 echo  ^|  Pretraining (SFT):                                        ^|
-echo  ^|   [4] Debug test (0.01B) -- 1 GPU, quick verify            ^|
 echo  ^|   [5] 7B Dense -- 1~8 GPU                                  ^|
 echo  ^|   [6] Ultra 7B (39B total / 7.5B active) -- 8 GPU          ^|
 echo  ^|   [7] Ultra 37B (200B / 37B) -- 32 GPU                     ^|
@@ -78,8 +81,9 @@ echo  ^|   [T] Run all tests                                        ^|
 echo  ^|   [Q] Quit                                                 ^|
 echo  +------------------------------------------------------------+
 echo(
-set /p CHOICE="  Select [1-9/G/D/T/Q]: "
+set /p CHOICE="  Select [0-9/G/D/T/Q]: "
 
+if "%CHOICE%"=="0" goto TRAIN_ARCH_CHECK
 if /i "%CHOICE%"=="1" goto DATA_CLEAN
 if /i "%CHOICE%"=="2" goto DATA_TOKENIZE
 if /i "%CHOICE%"=="3" goto DATA_FULL
@@ -235,6 +239,47 @@ echo(
 echo [DONE] Pipeline complete! Ready for training.
 pause
 goto MAIN_MENU
+
+:: =====================================================================
+::  TRAINING -- Architecture Verify
+:: =====================================================================
+
+:TRAIN_ARCH_CHECK
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Architecture Verify (0.1B, all Ultra features ON)         ^|
+echo  ^|  MoE + KDA-Diff + MTP + Interleave -- full stack check     ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  This verifies the COMPLETE architecture at small scale:
+echo    - DeepSeekMoE (2 shared + 16 routed, top-4)
+echo    - KDA-Diff (kernelized differential attention)
+echo    - MTP (multi-token prediction, depth=2)
+echo    - Interleave cross_layer (attn every 4th layer)
+echo    - Mamba-2 SSM with expand=1
+echo(
+echo  ^^! This runs ~300 steps on CPU (~30 min) or GPU (~2 min)
+echo(
+
+:: Generate arch-verify config
+python "%PROJECT_DIR%scripts\gen_arch_config.py"
+if %errorlevel% neq 0 (
+    echo [ERROR] Config generation failed!
+    pause
+    goto MAIN_MENU
+)
+
+set "CONFIG=%PROJECT_DIR%configs\_arch_verify.yaml"
+set BATCH_SIZE=1
+set GRAD_ACCUM=4
+set MAX_STEPS=300
+set LR=8e-4
+set MAX_SEQ_LEN=512
+set SAVE_EVERY=100
+set LOG_EVERY=10
+set WARMUP=30
+set WANDB_FLAG=
+goto TRAIN_START
 
 :: =====================================================================
 ::  TRAINING -- Debug

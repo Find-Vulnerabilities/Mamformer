@@ -95,30 +95,38 @@ class TextDataset(IterableDataset):
             }
 
     def _file_iterator(self):
-        """Stream from pre-tokenized files with shuffling."""
+        """Stream from pre-tokenized files, looping infinitely."""
         import random
         random.seed(self.seed)
 
         # Small carry-over buffer (list, kept small intentionally)
         buffer: list = []
-        for file_path in self.files:
-            raw_bytes = open(file_path, 'rb').read()
-            data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
-            # Iterate directly over the tensor with slicing -- no Python list conversion
-            pos = 0
-            n = data.shape[0]
-            while pos + self.seq_len + 1 <= n:
-                chunk = data[pos:pos + self.seq_len + 1]
-                pos += self.seq_len
-                yield {
-                    "input_ids": chunk[:-1].clone(),
-                    "labels": chunk[1:].clone(),
-                }
-            # Carry-over: only keep up to seq_len tokens to bound memory
-            if pos < n:
-                remainder = data[pos:].tolist()
-                buffer.extend(remainder[-self.seq_len:])  # Keep at most seq_len tokens
-            del data, raw_bytes
+        while True:
+            # Shuffle file order each epoch
+            files = list(self.files)
+            random.shuffle(files)
+            for file_path in files:
+                raw_bytes = open(file_path, 'rb').read()
+                data = torch.frombuffer(bytearray(raw_bytes), dtype=torch.uint16).long()
+                pos = 0
+                n = data.shape[0]
+                # Prepend carry-over from previous file
+                if buffer:
+                    data = torch.cat([torch.tensor(buffer, dtype=data.dtype), data])
+                    buffer = []
+                    n = data.shape[0]
+                while pos + self.seq_len + 1 <= n:
+                    chunk = data[pos:pos + self.seq_len + 1]
+                    pos += self.seq_len
+                    yield {
+                        "input_ids": chunk[:-1].clone(),
+                        "labels": chunk[1:].clone(),
+                    }
+                # Carry-over: keep at most seq_len tokens to bound memory
+                if pos < n:
+                    remainder = data[pos:].tolist()
+                    buffer = remainder[-self.seq_len:]
+                del data, raw_bytes
 
 
 # ── LR Schedule ────────────────────────────────────────────────────────

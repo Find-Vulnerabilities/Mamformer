@@ -27,7 +27,7 @@ if not exist "%GRPO_CHECKPOINT_DIR%" mkdir "%GRPO_CHECKPOINT_DIR%"
 set GPU_COUNT=0
 where nvidia-smi >nul 2>&1
 if %errorlevel% equ 0 (
-    for /f "skip=1 tokens=1" %%a in ('nvidia-smi --query-gpu=name --format=csv,noheader 2^>nul ^| find /c /v ""') do set GPU_COUNT=%%a
+    for /f "skip=0 tokens=1" %%a in ('nvidia-smi --query-gpu=name --format=csv,noheader 2^>nul ^| find /c /v ""') do set GPU_COUNT=%%a
 )
 if %GPU_COUNT% gtr 0 (
     echo [OK] Detected %GPU_COUNT% GPU(s)
@@ -55,14 +55,15 @@ echo  +------------------------------------------------------------+
 echo  ^|  Download Data (cloud GPU, auto tokenize):                ^|
 echo  ^|   [A] Debug (~1B tok) -^> debug + arch-verify              ^|
 echo  ^|   [B] 1B (~20B tok) -^> 1b preset                          ^|
-echo  ^|   [C] 7B (~140B tok) -^> 7b.yaml, pro-7b.yaml              ^|
+echo  ^|   [C] 7B (~140B tok) -^> 7b.yaml                             ^|
 echo  ^|   [D] Ultra 7B (~140B tok) -^> ultra-7b.yaml               ^|
 echo  ^|   [E] Ultra 37B (~740B tok) -^> ultra-37b.yaml             ^|
-echo  ^|   [F] Ultra 671B (~1T tok) -^> ultra-671b-max.yaml         ^|
+echo  ^|   [F] Ultra 371B (~560B tok) -^> ultra-371b.yaml           ^|
+echo  ^|   [H] Ultra 671B (~1T tok) -^> ultra-671b-max.yaml         ^|
 echo  +------------------------------------------------------------+
 echo  ^|  Data Processing (local files):                           ^|
-echo  ^|   [1] Auto clean + classify (scan data\raw\)               ^|
-echo  ^|   [2] Tokenize -^> .bin (need step 1 first)                ^|
+echo  ^|   [1] Auto clean + classify (scan data\raw\)              ^|
+echo  ^|   [2] Tokenize -^> .bin (need step 1 first)               ^|
 echo  ^|   [3] Full data pipeline (step 1 + 2, auto)               ^|
 echo  +------------------------------------------------------------+
 echo  ^|  Verify / Debug:                                          ^|
@@ -76,6 +77,9 @@ echo  ^|   [7] Ultra 37B (200B / 37B) -- 32 GPU                    ^|
 echo  ^|   [8] Ultra 371B (371B / 28B) -- 64 GPU                   ^|
 echo  ^|   [9] Ultra 671B MAX (671B / 37B) -- 64~128 GPU           ^|
 echo  +------------------------------------------------------------+
+echo  ^|  Quick Train (budget-friendly):                           ^|
+echo  ^|   [U] 1B Ultra (~40M active, all features) -- 1 GPU, ~8hr ^|
+echo  +------------------------------------------------------------+
 echo  ^|  Post-training:                                           ^|
 echo  ^|   [G] GRPO Reasoning RL (with S-GRPO option)              ^|
 echo  +------------------------------------------------------------+
@@ -87,14 +91,15 @@ echo  ^|   [T] Run all tests                                       ^|
 echo  ^|   [Q] Quit                                                ^|
 echo  +------------------------------------------------------------+
 echo(
-set /p CHOICE="  Select [0-9/A-F/G/R/T/Q]: "
+set /p CHOICE="  Select [0-9/A-H/G/R/T/U/Q]: "
 
 if /i "%CHOICE%"=="A" goto DATA_DL_DEBUG
 if /i "%CHOICE%"=="B" goto DATA_DL_1B
 if /i "%CHOICE%"=="C" goto DATA_DL_7B
 if /i "%CHOICE%"=="D" goto DATA_DL_ULTRA7B
 if /i "%CHOICE%"=="E" goto DATA_DL_ULTRA37B
-if /i "%CHOICE%"=="F" goto DATA_DL_ULTRA671B
+if /i "%CHOICE%"=="F" goto DATA_DL_ULTRA371B
+if /i "%CHOICE%"=="H" goto DATA_DL_ULTRA671B
 if "%CHOICE%"=="0" goto TRAIN_ARCH_CHECK
 if /i "%CHOICE%"=="1" goto DATA_CLEAN
 if /i "%CHOICE%"=="2" goto DATA_TOKENIZE
@@ -105,6 +110,7 @@ if "%CHOICE%"=="6" goto TRAIN_ULTRA7B
 if "%CHOICE%"=="7" goto TRAIN_ULTRA37B
 if "%CHOICE%"=="8" goto TRAIN_ULTRA371B
 if "%CHOICE%"=="9" goto TRAIN_ULTRA671B
+if /i "%CHOICE%"=="U" goto TRAIN_1B_ULTRA
 if /i "%CHOICE%"=="G" goto GRPO
 if /i "%CHOICE%"=="R" goto DEMO
 if /i "%CHOICE%"=="T" goto RUN_TESTS
@@ -181,6 +187,19 @@ set "DL_PRESET=--preset ultra-37b"
 set "DL_DESC=Ultra 37B (~740B tokens)"
 goto DATA_DL_START
 
+:DATA_DL_ULTRA371B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: ULTRA 371B (~560B tokens)                       ^|
+echo  ^|  For: ultra-371b.yaml (MoE ~371B / ~28B active)            ^|
+echo  ^|  Sources: ALL (FineWeb + C4 + DCLM + SlimPajama + Code)    ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  ^^! WARNING: This needs ~600GB+ free disk space!
+echo(
+set "DL_PRESET=--preset ultra-371b"
+set "DL_DESC=Ultra 371B (~560B tokens)"
+goto DATA_DL_START
 :DATA_DL_ULTRA671B
 echo(
 echo  +------------------------------------------------------------+
@@ -392,6 +411,34 @@ goto TRAIN_START
 ::  TRAINING -- Debug
 :: =====================================================================
 
+:TRAIN_1B_ULTRA
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  1B Ultra Train (~40M active, all features ON)             ^|
+echo  ^|  MoE + KDA-Diff + MTP + Interleave -- full architecture    ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  Budget: ~8 hours on H100
+echo  Good for: architecture validation at meaningful scale
+echo(
+python "%PROJECT_DIR%scripts\gen_1b_ultra_config.py"
+if %errorlevel% neq 0 (
+    echo [ERROR] Config generation failed!
+    pause
+    goto MAIN_MENU
+)
+set "CONFIG=%PROJECT_DIR%configs\_1b_ultra.yaml"
+set BATCH_SIZE=2
+set GRAD_ACCUM=4
+set MAX_STEPS=14000
+set LR=3e-4
+set MAX_SEQ_LEN=2048
+set SAVE_EVERY=2000
+set LOG_EVERY=50
+set WARMUP=500
+set WANDB_FLAG=
+goto TRAIN_START
+echo(
 :TRAIN_DEBUG
 echo(
 echo  +------------------------------------------------------------+
@@ -639,6 +686,8 @@ if /i "!USE_SGRPO!"=="y" (
     set SGRPO_FLAG=--sgrpo
     set /p SGRPO_P="    Token sampling probability [0.4]: "
     if "!SGRPO_P!"=="" set SGRPO_P=0.4
+set SGRPO_ALPHA=0
+set SGRPO_K=0
     set /p SGRPO_ALPHA="    First N tokens always kept [0]: "
     if "!SGRPO_ALPHA!"=="" set SGRPO_ALPHA=0
     set /p SGRPO_K="    Max tokens cap (0=disabled) [0]: "
@@ -650,9 +699,9 @@ echo(
 echo  Launching GRPO training...
 
 if %GPU_COUNT% leq 1 (
-    python "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 --bf16 --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
+    python "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 !BF16_FLAG! --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 ) else (
-    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 --bf16 --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
+    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 !BF16_FLAG! --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 )
 
 if %errorlevel% neq 0 (
@@ -756,6 +805,7 @@ if "%CONFIG%"=="debug" (
 ) else if "%MODEL_CHOICE%"=="5" (
     set SEQ_LEN=8192
 )
+if not defined CONFIG set "CONFIG=debug" & set SEQ_LEN=128
 goto :EOF
 
 :: =====================================================================

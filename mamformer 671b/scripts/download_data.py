@@ -108,10 +108,25 @@ PRESETS = {
         "approx_tokens": 740_000_000_000,
         "approx_raw_gb": 600,
     },
+    # ── Ultra 371B (MoE: ~371B total / ~28B active) ────────────
+    "ultra-371b": {
+        "desc": "~560B tokens — Chinchilla for 28B active MoE (~371B total)",
+        "for_models": "ultra-371b.yaml",
+        "sources": {
+            "fineweb": {"split": "train", "max_rows": 0},
+            "c4": {"split": "train", "max_rows": 0},
+            "dclm": {"split": "train", "max_rows": 0},
+            "slimpajama": {"split": "train", "max_rows": 0},
+            "starcoder": {"split": "train", "max_rows": 0},
+            "wikipedia": {"split": "train", "max_rows": 0},
+        },
+        "approx_tokens": 560_000_000_000,
+        "approx_raw_gb": 450,
+    },
     # ── Ultra 671B (MoE: ~671B total / ~37B active) ─────────────
     "ultra-671b": {
         "desc": "~1T tokens — DeepSeek-V3 scale for 37B active MoE",
-        "for_models": "ultra-671b-max.yaml (also ultra-371b.yaml)",
+        "for_models": "ultra-671b-max.yaml",
         "sources": {
             "fineweb": {"split": "train", "max_rows": 0},
             "c4": {"split": "train", "max_rows": 0},

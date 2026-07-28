@@ -244,10 +244,11 @@ while true; do
     echo "  |  Download Data (cloud GPU, auto tokenize):                |"
     echo "  |   [A] Debug (~1B tok) -> debug + arch-verify              |"
     echo "  |   [B] 1B (~20B tok) -> 1b preset                          |"
-    echo "  |   [C] 7B (~140B tok) -> 7b.yaml, pro-7b.yaml              |"
+    echo "  |   [C] 7B (~140B tok) -> 7b.yaml                             |"
     echo "  |   [D] Ultra 7B (~140B tok) -> ultra-7b.yaml               |"
     echo "  |   [E] Ultra 37B (~740B tok) -> ultra-37b.yaml             |"
-    echo "  |   [F] Ultra 671B (~1T tok) -> ultra-671b-max.yaml         |"
+    echo "  |   [F] Ultra 371B (~560B tok) -> ultra-371b.yaml           |"
+    echo "  |   [H] Ultra 671B (~1T tok) -> ultra-671b-max.yaml         |"
     echo "  +------------------------------------------------------------+"
     echo "  |  Data Processing (local files):                           |"
     echo "  |   [1] Auto clean + classify (scan data/raw/)              |"
@@ -265,6 +266,9 @@ while true; do
     echo "  |   [8] Ultra 371B (371B / 28B) -- 64 GPU                   |"
     echo "  |   [9] Ultra 671B MAX (671B / 37B) -- 64~128 GPU           |"
     echo "  +------------------------------------------------------------+"
+    echo "  |  Quick Train (budget-friendly):                           |"
+    echo "  |   [U] 1B Ultra (~40M active, all features) -- 1 GPU, ~8hr |"
+    echo "  +------------------------------------------------------------+"
     echo "  |  Post-training:                                           |"
     echo "  |   [G] GRPO Reasoning RL (with S-GRPO option)              |"
     echo "  +------------------------------------------------------------+"
@@ -276,7 +280,7 @@ while true; do
     echo "  |   [Q] Quit                                                |"
     echo "  +------------------------------------------------------------+"
     echo
-    read -p "  Select [0-9/A-F/G/R/T/Q]: " CHOICE
+    read -p "  Select [0-9/A-H/G/R/T/U/Q]: " CHOICE
 
     case "$CHOICE" in
         # -- Download Data --
@@ -284,8 +288,9 @@ while true; do
         [Bb]) data_download "1b"         "1B (~20B tokens)" ;;
         [Cc]) data_download "7b"         "7B (~140B tokens)" ;;
         [Dd]) data_download "ultra-7b"   "Ultra 7B (~140B tokens)" ;;
-        [Ee]) data_download "ultra-37b"  "Ultra 37B (~740B tokens)" ;;
-        [Ff]) data_download "ultra-671b" "Ultra 671B (~1T tokens)" ;;
+        [Ee]) data_download "ultra-37b"   "Ultra 37B (~740B tokens)" ;;
+        [Ff]) data_download "ultra-371b"  "Ultra 371B (~560B tokens)" ;;
+        [Hh]) data_download "ultra-671b"  "Ultra 671B (~1T tokens)" ;;
 
         # -- Data Processing --
         1)
@@ -444,6 +449,30 @@ while true; do
             train_launch
             ;;
 
+        # -- 1B Ultra Train (budget-friendly full architecture) --
+        [Uu])
+            echo
+            echo "  +------------------------------------------------------------+"
+            echo "  |  1B Ultra Train (~40M active, all features ON)             |"
+            echo "  |  MoE + KDA-Diff + MTP + Interleave -- full architecture    |"
+            echo "  +------------------------------------------------------------+"
+            echo
+            echo "  Budget: ~8 hours on H100 (~HK$184)"
+            echo "  Good for: architecture validation at meaningful scale"
+            echo
+            python "$PROJECT_DIR/scripts/gen_1b_ultra_config.py"
+            if [ $? -ne 0 ]; then
+                echo -e "${RED}[ERROR]${RESET} Config generation failed!"
+                read -p "Press Enter to continue..."
+                continue
+            fi
+            CONFIG="$PROJECT_DIR/configs/_1b_ultra.yaml"
+            BATCH_SIZE=2; GRAD_ACCUM=4; MAX_STEPS=14000; LR=3e-4
+            MAX_SEQ_LEN=2048; SAVE_EVERY=2000; LOG_EVERY=50; WARMUP=500
+            WANDB_FLAG=""
+            train_launch
+            ;;
+
         # -- GRPO --
         [Gg])
             echo
@@ -496,7 +525,7 @@ while true; do
                     --batch_size 4 \
                     --gradient_accumulation_steps 2 \
                     --learning_rate 1e-6 \
-                    --bf16 \
+                    $BF16_FLAG \
                     --max_prompt_len 2048 \
                     --gen_max_tokens 1024 \
                     --output_dir "$GRPO_CHECKPOINT_DIR" \
@@ -513,7 +542,7 @@ while true; do
                     --batch_size 4 \
                     --gradient_accumulation_steps 2 \
                     --learning_rate 1e-6 \
-                    --bf16 \
+                    $BF16_FLAG \
                     --max_prompt_len 2048 \
                     --gen_max_tokens 1024 \
                     --output_dir "$GRPO_CHECKPOINT_DIR" \

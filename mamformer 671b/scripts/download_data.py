@@ -41,15 +41,20 @@ from typing import Optional
 
 # ── Presets: estimated raw text → tokenized size ──────────────────────
 # Tokens ≈ raw_bytes / 4 (roughly, depends on tokenizer)
+# Chinchilla optimal: ~20× params for dense, ~20× active_params for MoE
 PRESETS = {
-    "quick": {
-        "desc": "~5B tokens (~4GB raw) — architecture verification",
-        "sources": {"fineweb": {"split": "train", "max_rows": 200_000}},
-        "approx_tokens": 5_000_000_000,
-        "approx_raw_gb": 4,
+    # ── Debug / Verify ──────────────────────────────────────────
+    "debug": {
+        "desc": "~1B tokens — debug/arch verify (configs: debug, arch-verify)",
+        "for_models": "debug, arch-verify (0.01B~0.1B)",
+        "sources": {"fineweb": {"split": "train", "max_rows": 50_000}},
+        "approx_tokens": 1_000_000_000,
+        "approx_raw_gb": 1,
     },
-    "standard": {
-        "desc": "~20B tokens (~16GB raw) — decent 7B pretrain",
+    # ── 1B models ───────────────────────────────────────────────
+    "1b": {
+        "desc": "~20B tokens — Chinchilla for 1B dense",
+        "for_models": "1b preset",
         "sources": {
             "fineweb": {"split": "train", "max_rows": 500_000},
             "c4": {"split": "train", "max_rows": 300_000},
@@ -58,30 +63,65 @@ PRESETS = {
         "approx_tokens": 20_000_000_000,
         "approx_raw_gb": 16,
     },
-    "full": {
-        "desc": "~100B tokens (~80GB raw) — competitive 7B pretrain",
+    # ── 7B Dense ────────────────────────────────────────────────
+    "7b": {
+        "desc": "~140B tokens — Chinchilla for 7B dense (~6.5B params)",
+        "for_models": "7b.yaml, pro-7b.yaml, ultra-7b-dense.yaml",
         "sources": {
-            "fineweb": {"split": "train", "max_rows": 2_000_000},
-            "c4": {"split": "train", "max_rows": 1_500_000},
-            "dclm": {"split": "train", "max_rows": 1_000_000},
-            "slimpajama": {"split": "train", "max_rows": 2_000_000},
+            "fineweb": {"split": "train", "max_rows": 3_000_000},
+            "c4": {"split": "train", "max_rows": 2_000_000},
+            "dclm": {"split": "train", "max_rows": 1_500_000},
+            "slimpajama": {"split": "train", "max_rows": 2_500_000},
             "starcoder": {"split": "train", "max_rows": 500_000},
             "wikipedia": {"split": "train", "max_rows": 500_000},
         },
-        "approx_tokens": 100_000_000_000,
-        "approx_raw_gb": 80,
+        "approx_tokens": 140_000_000_000,
+        "approx_raw_gb": 110,
     },
-    "max": {
-        "desc": "~500B+ tokens (~400GB raw) — Chinchilla-optimal 7B",
+    # ── Ultra 7B (MoE: ~39B total / ~7.2B active) ───────────────
+    "ultra-7b": {
+        "desc": "~140B tokens — Chinchilla for 7.2B active MoE (~39B total)",
+        "for_models": "ultra-7b.yaml",
+        "sources": {
+            "fineweb": {"split": "train", "max_rows": 3_000_000},
+            "c4": {"split": "train", "max_rows": 2_000_000},
+            "dclm": {"split": "train", "max_rows": 1_500_000},
+            "slimpajama": {"split": "train", "max_rows": 2_500_000},
+            "starcoder": {"split": "train", "max_rows": 500_000},
+            "wikipedia": {"split": "train", "max_rows": 500_000},
+        },
+        "approx_tokens": 140_000_000_000,
+        "approx_raw_gb": 110,
+    },
+    # ── Ultra 37B (MoE: ~200B total / ~37B active) ──────────────
+    "ultra-37b": {
+        "desc": "~740B tokens — Chinchilla for 37B active MoE (~200B total)",
+        "for_models": "ultra-37b.yaml",
         "sources": {
             "fineweb": {"split": "train", "max_rows": 0},        # 0 = all
+            "c4": {"split": "train", "max_rows": 0},
             "dclm": {"split": "train", "max_rows": 0},
             "slimpajama": {"split": "train", "max_rows": 0},
             "starcoder": {"split": "train", "max_rows": 0},
             "wikipedia": {"split": "train", "max_rows": 0},
         },
-        "approx_tokens": 500_000_000_000,
-        "approx_raw_gb": 400,
+        "approx_tokens": 740_000_000_000,
+        "approx_raw_gb": 600,
+    },
+    # ── Ultra 671B (MoE: ~671B total / ~37B active) ─────────────
+    "ultra-671b": {
+        "desc": "~1T tokens — DeepSeek-V3 scale for 37B active MoE",
+        "for_models": "ultra-671b-max.yaml (also ultra-371b.yaml)",
+        "sources": {
+            "fineweb": {"split": "train", "max_rows": 0},
+            "c4": {"split": "train", "max_rows": 0},
+            "dclm": {"split": "train", "max_rows": 0},
+            "slimpajama": {"split": "train", "max_rows": 0},
+            "starcoder": {"split": "train", "max_rows": 0},
+            "wikipedia": {"split": "train", "max_rows": 0},
+        },
+        "approx_tokens": 1_000_000_000_000,
+        "approx_raw_gb": 800,
     },
 }
 

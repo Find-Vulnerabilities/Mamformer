@@ -3,9 +3,7 @@ chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 
 :: ======================================================================
-::   Mamformer -- One-Click Training Script
-::   Auto: Data Processing -> Tokenization -> Pretraining -> GRPO
-::   Encoding: ASCII-safe (works on GBK/UTF-8/all codepages)
+::   Mamformer -- One-Click Training Script v0.5
 :: ======================================================================
 
 title Mamformer Training Pipeline
@@ -50,39 +48,53 @@ if %GPU_COUNT% geq 1 set BF16_FLAG=--bf16
 cls
 echo(
 echo  +============================================================+
-echo  ^|        Mamformer One-Click Training v0.4                  ^|
+echo  ^|        Mamformer One-Click Training v0.5                  ^|
 echo  +============================================================+
 echo  ^|  GPU Count: %GPU_COUNT%
 echo  +------------------------------------------------------------+
-echo  ^|  Data Processing:                                          ^|
+echo  ^|  Download Data (cloud GPU, auto tokenize):                ^|
+echo  ^|   [A] Debug (~1B tok) -^> debug + arch-verify              ^|
+echo  ^|   [B] 1B (~20B tok) -^> 1b preset                          ^|
+echo  ^|   [C] 7B (~140B tok) -^> 7b.yaml, pro-7b.yaml              ^|
+echo  ^|   [D] Ultra 7B (~140B tok) -^> ultra-7b.yaml               ^|
+echo  ^|   [E] Ultra 37B (~740B tok) -^> ultra-37b.yaml             ^|
+echo  ^|   [F] Ultra 671B (~1T tok) -^> ultra-671b-max.yaml         ^|
+echo  +------------------------------------------------------------+
+echo  ^|  Data Processing (local files):                           ^|
 echo  ^|   [1] Auto clean + classify (scan data\raw\)               ^|
 echo  ^|   [2] Tokenize -^> .bin (need step 1 first)                ^|
-echo  ^|   [3] Full data pipeline (step 1 + 2, auto)                ^|
+echo  ^|   [3] Full data pipeline (step 1 + 2, auto)               ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Verify / Debug:                                           ^|
-echo  ^|   [0] Arch Verify (0.1B + all features) -- CPU/1GPU, ~30m  ^|
-echo  ^|   [4] Debug test (0.01B, basic) -- quick pipeline check     ^|
+echo  ^|  Verify / Debug:                                          ^|
+echo  ^|   [0] Arch Verify (0.1B + all features) -- CPU/1GPU, ~30m ^|
+echo  ^|   [4] Debug test (0.01B, basic) -- quick pipeline check   ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Pretraining (SFT):                                        ^|
-echo  ^|   [5] 7B Dense -- 1~8 GPU                                  ^|
-echo  ^|   [6] Ultra 7B (39B total / 7.5B active) -- 8 GPU          ^|
-echo  ^|   [7] Ultra 37B (200B / 37B) -- 32 GPU                     ^|
-echo  ^|   [8] Ultra 371B (371B / 28B) -- 64 GPU                    ^|
-echo  ^|   [9] Ultra 671B MAX (671B / 37B) -- 64~128 GPU            ^|
+echo  ^|  Pretraining (SFT):                                       ^|
+echo  ^|   [5] 7B Dense -- 1~8 GPU                                 ^|
+echo  ^|   [6] Ultra 7B (39B total / 7.5B active) -- 8 GPU         ^|
+echo  ^|   [7] Ultra 37B (200B / 37B) -- 32 GPU                    ^|
+echo  ^|   [8] Ultra 371B (371B / 28B) -- 64 GPU                   ^|
+echo  ^|   [9] Ultra 671B MAX (671B / 37B) -- 64~128 GPU           ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Post-training:                                            ^|
-echo  ^|   [G] GRPO Reasoning RL (with S-GRPO option)               ^|
+echo  ^|  Post-training:                                           ^|
+echo  ^|   [G] GRPO Reasoning RL (with S-GRPO option)              ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Inference / Demo:                                         ^|
-echo  ^|   [D] Generate with thinking mode                          ^|
+echo  ^|  Inference / Demo:                                        ^|
+echo  ^|   [R] Generate with thinking mode                         ^|
 echo  +------------------------------------------------------------+
-echo  ^|  Other:                                                    ^|
-echo  ^|   [T] Run all tests                                        ^|
-echo  ^|   [Q] Quit                                                 ^|
+echo  ^|  Other:                                                   ^|
+echo  ^|   [T] Run all tests                                       ^|
+echo  ^|   [Q] Quit                                                ^|
 echo  +------------------------------------------------------------+
 echo(
-set /p CHOICE="  Select [0-9/G/D/T/Q]: "
+set /p CHOICE="  Select [0-9/A-F/G/R/T/Q]: "
 
+if /i "%CHOICE%"=="A" goto DATA_DL_DEBUG
+if /i "%CHOICE%"=="B" goto DATA_DL_1B
+if /i "%CHOICE%"=="C" goto DATA_DL_7B
+if /i "%CHOICE%"=="D" goto DATA_DL_ULTRA7B
+if /i "%CHOICE%"=="E" goto DATA_DL_ULTRA37B
+if /i "%CHOICE%"=="F" goto DATA_DL_ULTRA671B
 if "%CHOICE%"=="0" goto TRAIN_ARCH_CHECK
 if /i "%CHOICE%"=="1" goto DATA_CLEAN
 if /i "%CHOICE%"=="2" goto DATA_TOKENIZE
@@ -94,13 +106,125 @@ if "%CHOICE%"=="7" goto TRAIN_ULTRA37B
 if "%CHOICE%"=="8" goto TRAIN_ULTRA371B
 if "%CHOICE%"=="9" goto TRAIN_ULTRA671B
 if /i "%CHOICE%"=="G" goto GRPO
-if /i "%CHOICE%"=="D" goto DEMO
+if /i "%CHOICE%"=="R" goto DEMO
 if /i "%CHOICE%"=="T" goto RUN_TESTS
 if /i "%CHOICE%"=="Q" goto END
 goto MAIN_MENU
 
 :: =====================================================================
-::  DATA PROCESSING
+::  DATA DOWNLOAD (Auto from HuggingFace)
+:: =====================================================================
+
+:DATA_DL_DEBUG
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: DEBUG (~1B tokens)                              ^|
+echo  ^|  For: debug + arch-verify models                           ^|
+echo  ^|  Source: FineWeb-Edu sample                                ^|
+echo  +------------------------------------------------------------+
+echo(
+set "DL_PRESET=--preset debug"
+set "DL_DESC=Debug (~1B tokens)"
+goto DATA_DL_START
+
+:DATA_DL_1B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: 1B MODEL (~20B tokens)                          ^|
+echo  ^|  For: 1b preset (Chinchilla: 20x params)                   ^|
+echo  ^|  Sources: FineWeb-Edu + C4 + SlimPajama                    ^|
+echo  +------------------------------------------------------------+
+echo(
+set "DL_PRESET=--preset 1b"
+set "DL_DESC=1B (~20B tokens)"
+goto DATA_DL_START
+
+:DATA_DL_7B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: 7B DENSE (~140B tokens)                         ^|
+echo  ^|  For: 7b.yaml, pro-7b.yaml (Chinchilla: 20x ~6.5B)        ^|
+echo  ^|  Sources: FineWeb + C4 + DCLM + SlimPajama + Code + Wiki   ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  ^^! WARNING: This needs ~150GB+ free disk space!
+echo(
+set "DL_PRESET=--preset 7b"
+set "DL_DESC=7B (~140B tokens)"
+goto DATA_DL_START
+
+:DATA_DL_ULTRA7B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: ULTRA 7B (~140B tokens)                         ^|
+echo  ^|  For: ultra-7b.yaml (MoE ~39B / ~7.2B active)              ^|
+echo  ^|  Sources: FineWeb + C4 + DCLM + SlimPajama + Code + Wiki   ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  ^^! WARNING: This needs ~150GB+ free disk space!
+echo(
+set "DL_PRESET=--preset ultra-7b"
+set "DL_DESC=Ultra 7B (~140B tokens)"
+goto DATA_DL_START
+
+:DATA_DL_ULTRA37B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: ULTRA 37B (~740B tokens)                        ^|
+echo  ^|  For: ultra-37b.yaml (MoE ~200B / ~37B active)             ^|
+echo  ^|  Sources: ALL (FineWeb + C4 + DCLM + SlimPajama + Code)    ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  ^^! WARNING: This needs ~800GB+ free disk space!
+echo(
+set "DL_PRESET=--preset ultra-37b"
+set "DL_DESC=Ultra 37B (~740B tokens)"
+goto DATA_DL_START
+
+:DATA_DL_ULTRA671B
+echo(
+echo  +------------------------------------------------------------+
+echo  ^|  Download: ULTRA 671B (~1T tokens)                         ^|
+echo  ^|  For: ultra-671b-max.yaml (MoE ~671B / ~37B active)        ^|
+echo  ^|  Sources: ALL (FineWeb + C4 + DCLM + SlimPajama + Code)    ^|
+echo  +------------------------------------------------------------+
+echo(
+echo  ^^! WARNING: This needs ~1TB+ free disk space!
+echo(
+set "DL_PRESET=--preset ultra-671b"
+set "DL_DESC=Ultra 671B (~1T tokens)"
+goto DATA_DL_START
+
+:DATA_DL_START
+echo  -------------------------------------------------------------
+echo    Preset: %DL_DESC%
+echo    Tokenizer: huggyllama/llama-7b
+echo    Seq len: 8192
+echo    Output: data\
+echo  -------------------------------------------------------------
+echo(
+echo  Requires: pip install datasets transformers tqdm
+echo(
+set /p DL_CONFIRM="  Start download? [Y/n]: "
+if /i "!DL_CONFIRM!"=="n" goto MAIN_MENU
+
+echo(
+echo  Downloading + Tokenizing... (this may take hours for large presets)
+echo(
+python "%PROJECT_DIR%scripts\download_data.py" %DL_PRESET% --output "%PROJECT_DIR%data" --tokenizer huggyllama/llama-7b --seq_len 8192
+if %errorlevel% neq 0 (
+    echo [ERROR] Download failed! Check internet and disk space.
+    pause
+    goto MAIN_MENU
+)
+echo(
+echo [DONE] Data downloaded and tokenized to data\tokenized\
+echo   Ready for training -- select option 5/6/7/etc.
+pause
+goto MAIN_MENU
+
+:: =====================================================================
+::  DATA PROCESSING (local files)
 :: =====================================================================
 
 :DATA_CLEAN
@@ -112,9 +236,7 @@ echo  ^|  Supports: .txt .jsonl .csv .md .html .py .js .tex .pdf   ^|
 echo  +------------------------------------------------------------+
 echo(
 echo  Processing...
-python "%PROJECT_DIR%scripts\data_pipeline.py" ^
-    --input "%DATA_RAW%" ^
-    --output "%DATA_PROCESSED%"
+python "%PROJECT_DIR%scripts\data_pipeline.py" --input "%DATA_RAW%" --output "%DATA_PROCESSED%"
 if %errorlevel% neq 0 (
     echo [ERROR] Data cleaning failed!
     pause
@@ -139,8 +261,7 @@ set /p NUM_SHARDS="  Shard count [64]: "
 if "%NUM_SHARDS%"=="" set NUM_SHARDS=64
 echo(
 echo  Tokenizing...
-echo  Make sure data\processed\ has cleaned files.
-echo  If not, run step 1 first.
+echo  Make sure data\processed\ has cleaned files. Run step 1 first.
 echo(
 pause
 
@@ -167,13 +288,7 @@ if !errorlevel! equ 0 (
     set INPUT_TYPE=txt
 )
 
-python "%PROJECT_DIR%scripts\prepare_data.py" ^
-    --input "!FOUND_INPUT!" ^
-    --input_type !INPUT_TYPE! ^
-    --output "%DATA_TOKENIZED%" ^
-    --tokenizer huggyllama/llama-7b ^
-    --seq_len %SEQ_LEN% ^
-    --num_shards %NUM_SHARDS%
+python "%PROJECT_DIR%scripts\prepare_data.py" --input "!FOUND_INPUT!" --input_type !INPUT_TYPE! --output "%DATA_TOKENIZED%" --tokenizer huggyllama/llama-7b --seq_len %SEQ_LEN% --num_shards %NUM_SHARDS%
 
 if %errorlevel% neq 0 (
     echo [ERROR] Tokenization failed!
@@ -193,9 +308,7 @@ echo(
 
 :: Step 1: Clean
 echo [1/2] Cleaning data...
-python "%PROJECT_DIR%scripts\data_pipeline.py" ^
-    --input "%DATA_RAW%" ^
-    --output "%DATA_PROCESSED%"
+python "%PROJECT_DIR%scripts\data_pipeline.py" --input "%DATA_RAW%" --output "%DATA_PROCESSED%"
 if %errorlevel% neq 0 (
     echo [ERROR] Cleaning failed!
     pause
@@ -222,13 +335,7 @@ if "!FOUND_INPUT!"=="" (
 echo !FOUND_INPUT! | findstr /i "\.jsonl$" >nul
 if !errorlevel! equ 0 (set INPUT_TYPE=jsonl) else (set INPUT_TYPE=txt)
 
-python "%PROJECT_DIR%scripts\prepare_data.py" ^
-    --input "!FOUND_INPUT!" ^
-    --input_type !INPUT_TYPE! ^
-    --output "%DATA_TOKENIZED%" ^
-    --tokenizer huggyllama/llama-7b ^
-    --seq_len %SEQ_LEN% ^
-    --num_shards 64
+python "%PROJECT_DIR%scripts\prepare_data.py" --input "!FOUND_INPUT!" --input_type !INPUT_TYPE! --output "%DATA_TOKENIZED%" --tokenizer huggyllama/llama-7b --seq_len %SEQ_LEN% --num_shards 64
 
 if %errorlevel% neq 0 (
     echo [ERROR] Tokenization failed!
@@ -335,7 +442,7 @@ goto TRAIN_START
 echo(
 echo  +------------------------------------------------------------+
 echo  ^|  Mamformer Ultra 7B                                        ^|
-echo  ^|  ~39B total / ~7.5B active, 8K context, MoE + DSA + MTP   ^|
+echo  ^|  ~39B total / ~7.5B active, 8K context, MoE + KDA + MTP   ^|
 echo  +------------------------------------------------------------+
 set "CONFIG=%PROJECT_DIR%configs\ultra-7b.yaml"
 set BATCH_SIZE=1
@@ -358,7 +465,6 @@ echo(
 echo  +------------------------------------------------------------+
 echo  ^|  Mamformer Ultra 37B                                       ^|
 echo  ^|  ~200B total / ~37B active, 128K context                   ^|
-echo  ^|  Recommended: 32 GPU (4 nodes x 8 GPU)                     ^|
 echo  +------------------------------------------------------------+
 set "CONFIG=%PROJECT_DIR%configs\ultra-37b.yaml"
 set BATCH_SIZE=1
@@ -370,11 +476,7 @@ set SAVE_EVERY=5000
 set LOG_EVERY=10
 set WARMUP=4000
 set WANDB_FLAG=--use_wandb
-set TP_SIZE=2
-set PP_SIZE=2
-set EP_SIZE=2
-set DP_SIZE=4
-goto TRAIN_DIST_START
+goto TRAIN_START
 
 :: =====================================================================
 ::  TRAINING -- Ultra 371B
@@ -385,7 +487,6 @@ echo(
 echo  +------------------------------------------------------------+
 echo  ^|  Mamformer Ultra 371B                                      ^|
 echo  ^|  371B total / 28B active, 256K context                     ^|
-echo  ^|  Recommended: 64 GPU (8 nodes x 8 GPU)                     ^|
 echo  +------------------------------------------------------------+
 set "CONFIG=%PROJECT_DIR%configs\ultra-371b.yaml"
 set BATCH_SIZE=1
@@ -397,11 +498,7 @@ set SAVE_EVERY=5000
 set LOG_EVERY=10
 set WARMUP=4000
 set WANDB_FLAG=--use_wandb
-set TP_SIZE=4
-set PP_SIZE=4
-set EP_SIZE=2
-set DP_SIZE=2
-goto TRAIN_DIST_START
+goto TRAIN_START
 
 :: =====================================================================
 ::  TRAINING -- Ultra 671B MAX
@@ -412,8 +509,6 @@ echo(
 echo  +------------------------------------------------------------+
 echo  ^|  Mamformer Ultra 671B MAX                                  ^|
 echo  ^|  671B total / 37B active, 1M context, 52 layers            ^|
-echo  ^|  Recommended: 64~128 GPU (8~16 nodes x 8 GPU)             ^|
-echo  ^|  Requires: CPU offload + FSDP + gradient checkpointing     ^|
 echo  +------------------------------------------------------------+
 set "CONFIG=%PROJECT_DIR%configs\ultra-671b-max.yaml"
 set BATCH_SIZE=1
@@ -425,14 +520,10 @@ set SAVE_EVERY=5000
 set LOG_EVERY=10
 set WARMUP=4000
 set WANDB_FLAG=--use_wandb
-set TP_SIZE=4
-set PP_SIZE=4
-set EP_SIZE=2
-set DP_SIZE=2
-goto TRAIN_DIST_START
+goto TRAIN_START
 
 :: =====================================================================
-::  TRAINING LAUNCH (Single Node / FSDP)
+::  TRAINING LAUNCH (Single Node)
 :: =====================================================================
 
 :TRAIN_START
@@ -457,7 +548,7 @@ if /i "!USE_COMM!"=="y" (
     echo   [OK] CommunicativeMoE enabled
 )
 
-:: Thinking format option (SFT with reasoning tokens)
+:: Thinking format option
 set /p USE_THINK="  Train with thinking tokens? [y/N]: "
 set THINK_FLAG=
 if /i "!USE_THINK!"=="y" (
@@ -489,102 +580,12 @@ echo(
 echo  Launching training...
 
 if %GPU_COUNT% leq 1 (
-    :: Single GPU
-    echo   Mode: CPU
-    python "%PROJECT_DIR%scripts\train.py" ^
-        --config "%CONFIG%" ^
-        --data "%DATA_TOKENIZED%" ^
-        --batch_size %BATCH_SIZE% ^
-        --gradient_accumulation_steps %GRAD_ACCUM% ^
-        --max_steps %MAX_STEPS% ^
-        --learning_rate %LR% ^
-        --max_seq_len %MAX_SEQ_LEN% ^
-        --warmup_steps %WARMUP% ^
-        --save_every %SAVE_EVERY% ^
-        --log_every %LOG_EVERY% ^
-        --output_dir "%CHECKPOINT_DIR%" ^
-        !BF16_FLAG! ^
-        !WANDB_FLAG! ^
-        !COMM_FLAG! ^
-        !THINK_FLAG! ^
-        !RESUME_FLAG!
+    if %GPU_COUNT% equ 0 (echo   Mode: CPU) else (echo   Mode: Single GPU)
+    python "%PROJECT_DIR%scripts\train.py" --config "%CONFIG%" --data "%DATA_TOKENIZED%" --batch_size %BATCH_SIZE% --gradient_accumulation_steps %GRAD_ACCUM% --max_steps %MAX_STEPS% --learning_rate %LR% --max_seq_len %MAX_SEQ_LEN% --warmup_steps %WARMUP% --save_every %SAVE_EVERY% --log_every %LOG_EVERY% --output_dir "%CHECKPOINT_DIR%" !BF16_FLAG! !WANDB_FLAG! !COMM_FLAG! !THINK_FLAG! !RESUME_FLAG!
 ) else (
-    :: Multi-GPU FSDP
     echo   Mode: %GPU_COUNT% GPU (FSDP)
-    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train.py" ^
-        --config "%CONFIG%" ^
-        --data "%DATA_TOKENIZED%" ^
-        --batch_size %BATCH_SIZE% ^
-        --gradient_accumulation_steps %GRAD_ACCUM% ^
-        --max_steps %MAX_STEPS% ^
-        --learning_rate %LR% ^
-        --max_seq_len %MAX_SEQ_LEN% ^
-        --warmup_steps %WARMUP% ^
-        --save_every %SAVE_EVERY% ^
-        --log_every %LOG_EVERY% ^
-        --output_dir "%CHECKPOINT_DIR%" ^
-        !BF16_FLAG! ^
-        !WANDB_FLAG! ^
-        !COMM_FLAG! ^
-        !THINK_FLAG! ^
-        !RESUME_FLAG!
+    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train.py" --config "%CONFIG%" --data "%DATA_TOKENIZED%" --batch_size %BATCH_SIZE% --gradient_accumulation_steps %GRAD_ACCUM% --max_steps %MAX_STEPS% --learning_rate %LR% --max_seq_len %MAX_SEQ_LEN% --warmup_steps %WARMUP% --save_every %SAVE_EVERY% --log_every %LOG_EVERY% --output_dir "%CHECKPOINT_DIR%" !BF16_FLAG! !WANDB_FLAG! !COMM_FLAG! !THINK_FLAG! !RESUME_FLAG!
 )
-
-if %errorlevel% neq 0 (
-    echo [ERROR] Training terminated abnormally
-    pause
-    goto MAIN_MENU
-)
-echo [DONE] Training complete!
-pause
-goto MAIN_MENU
-
-:: =====================================================================
-::  TRAINING LAUNCH (Multi-Node 4D Parallel)
-:: =====================================================================
-
-:TRAIN_DIST_START
-set /a TOTAL_GPU = %TP_SIZE% * %PP_SIZE% * %EP_SIZE% * %DP_SIZE%
-echo(
-echo  -- 4D Parallel Training Parameters --------------------------
-echo    Config:           %CONFIG%
-echo    TP=%TP_SIZE%  PP=%PP_SIZE%  EP=%EP_SIZE%  DP=%DP_SIZE%
-echo    Total GPUs:       %TOTAL_GPU%
-echo    Batch size:       %BATCH_SIZE%
-echo    Gradient accum:   %GRAD_ACCUM%
-echo    Max steps:        %MAX_STEPS%
-echo    Learning rate:    %LR%
-echo  -------------------------------------------------------------
-echo(
-
-if %GPU_COUNT% geq %TOTAL_GPU% (
-    set NNODES=1
-    set NPROC=%TOTAL_GPU%
-) else (
-    echo   Available GPU: %GPU_COUNT%, Required: %TOTAL_GPU%
-    echo   Using multi-node mode
-    set /p NNODES="  Enter node count: "
-    set NPROC=%GPU_COUNT%
-)
-
-echo(
-echo  Launching 4D parallel training...
-
-torchrun --nnodes=!NNODES! --nproc_per_node=!NPROC! "%PROJECT_DIR%scripts\train_distributed.py" ^
-    --config "%CONFIG%" ^
-    --data "%DATA_TOKENIZED%" ^
-    --tp %TP_SIZE% --pp %PP_SIZE% --ep %EP_SIZE% --dp %DP_SIZE% ^
-    --batch_size %BATCH_SIZE% ^
-    --gradient_accumulation_steps %GRAD_ACCUM% ^
-    --max_steps %MAX_STEPS% ^
-    --learning_rate %LR% ^
-    --max_seq_len %MAX_SEQ_LEN% ^
-    --warmup_steps %WARMUP% ^
-    --save_every %SAVE_EVERY% ^
-    --log_every %LOG_EVERY% ^
-    --output_dir "%CHECKPOINT_DIR%" ^
-    !BF16_FLAG! ^
-    %WANDB_FLAG%
 
 if %errorlevel% neq 0 (
     echo [ERROR] Training terminated abnormally
@@ -645,51 +646,13 @@ if /i "!USE_SGRPO!"=="y" (
     echo   [OK] S-GRPO enabled (p=!SGRPO_P!, alpha=!SGRPO_ALPHA!, k=!SGRPO_K!)
 )
 
-:: Thinking reward option
-set /p USE_THINK_R="  Include thinking quality reward? [y/N]: "
-set THINK_R_FLAG=
-if /i "!USE_THINK_R!"=="y" (
-    set THINK_R_FLAG=--reward_type combined
-    echo   [OK] Thinking quality reward added
-)
-
 echo(
 echo  Launching GRPO training...
 
 if %GPU_COUNT% leq 1 (
-    python "%PROJECT_DIR%scripts\train_grpo.py" ^
-        --config "!CONFIG!" ^
-        --checkpoint "%GRPO_CKPT%" ^
-        --data "%GRPO_DATA%" ^
-        --reward_type %GRPO_REWARD% ^
-        --group_size %GRPO_G% ^
-        --kl_beta %GRPO_BETA% ^
-        --max_steps %GRPO_MAX_STEPS% ^
-        --batch_size 4 ^
-        --gradient_accumulation_steps 2 ^
-        --learning_rate 1e-6 ^
-        !BF16_FLAG! ^
-        --max_prompt_len 2048 ^
-        --gen_max_tokens 1024 ^
-        --output_dir "%GRPO_CHECKPOINT_DIR%" ^
-        !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
+    python "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 --bf16 --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 ) else (
-    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train_grpo.py" ^
-        --config "!CONFIG!" ^
-        --checkpoint "%GRPO_CKPT%" ^
-        --data "%GRPO_DATA%" ^
-        --reward_type %GRPO_REWARD% ^
-        --group_size %GRPO_G% ^
-        --kl_beta %GRPO_BETA% ^
-        --max_steps %GRPO_MAX_STEPS% ^
-        --batch_size 4 ^
-        --gradient_accumulation_steps 2 ^
-        --learning_rate 1e-6 ^
-        !BF16_FLAG! ^
-        --max_prompt_len 2048 ^
-        --gen_max_tokens 1024 ^
-        --output_dir "%GRPO_CHECKPOINT_DIR%" ^
-        !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
+    torchrun --nproc_per_node=%GPU_COUNT% "%PROJECT_DIR%scripts\train_grpo.py" --config "!CONFIG!" --checkpoint "%GRPO_CKPT%" --data "%GRPO_DATA%" --reward_type %GRPO_REWARD% --group_size %GRPO_G% --kl_beta %GRPO_BETA% --max_steps %GRPO_MAX_STEPS% --batch_size 4 --gradient_accumulation_steps 2 --learning_rate 1e-6 --bf16 --max_prompt_len 2048 --gen_max_tokens 1024 --output_dir "%GRPO_CHECKPOINT_DIR%" !SGRPO_FLAG! --sgrpo_p !SGRPO_P! --sgrpo_alpha !SGRPO_ALPHA! --sgrpo_k !SGRPO_K!
 )
 
 if %errorlevel% neq 0 (
@@ -740,13 +703,7 @@ if not "%DEMO_CKPT%"=="" set CKPT_ARG=--checkpoint "%DEMO_CKPT%"
 
 echo(
 echo  Generating...
-python "%PROJECT_DIR%scripts\generate.py" ^
-    --config "!CONFIG!" ^
-    --prompt "!DEMO_PROMPT!" ^
-    !CKPT_ARG! ^
-    --max_new_tokens %DEMO_TOKENS% ^
-    --temperature 0.7 ^
-    !THINK_ARGS!
+python "%PROJECT_DIR%scripts\generate.py" --config "!CONFIG!" --prompt "!DEMO_PROMPT!" !CKPT_ARG! --max_new_tokens %DEMO_TOKENS% --temperature 0.7 !THINK_ARGS!
 
 echo(
 pause

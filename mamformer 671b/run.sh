@@ -17,7 +17,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATA_RAW="$PROJECT_DIR/data/raw"
 DATA_PROCESSED="$PROJECT_DIR/data/processed"
 DATA_TOKENIZED="$PROJECT_DIR/data/tokenized"
-CHECKPOINT_DIR="$PROJECT_DIR/checkpoints"
+CHECKPOINT_DIR="/workspace/checkpoints"
 GRPO_CHECKPOINT_DIR="$PROJECT_DIR/grpo_checkpoints"
 
 # -- Create directories ---------------------------------------------

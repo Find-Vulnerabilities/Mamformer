@@ -192,9 +192,9 @@ def check_disk_space(path: str, required_gb: float) -> bool:
         usage = shutil.disk_usage(path)
         free_gb = usage.free / (1024 ** 3)
         if free_gb < required_gb:
-            print(f"  ⚠ WARNING: only {free_gb:.0f}GB free, need ~{required_gb:.0f}GB")
+            print(f"  [WARN] WARNING: only {free_gb:.0f}GB free, need ~{required_gb:.0f}GB")
             return False
-        print(f"  ✅ Disk: {free_gb:.0f}GB free (need ~{required_gb:.0f}GB)")
+        print(f"  [OK] Disk: {free_gb:.0f}GB free (need ~{required_gb:.0f}GB)")
         return True
     except Exception:
         return True  # can't check, assume ok
@@ -209,7 +209,7 @@ def check_deps() -> bool:
         except ImportError:
             missing.append(pkg)
     if missing:
-        print(f"  ❌ Missing packages: {', '.join(missing)}")
+        print(f"  [ERR] Missing packages: {', '.join(missing)}")
         print(f"  Run: pip install {' '.join(missing)}")
         return False
 
@@ -217,7 +217,7 @@ def check_deps() -> bool:
     try:
         __import__("transformers")
     except ImportError:
-        print("  ⚠ 'transformers' not installed (needed for tokenizer)")
+        print("  [WARN] 'transformers' not installed (needed for tokenizer)")
         print("  Run: pip install transformers")
         return False
     return True
@@ -247,7 +247,7 @@ def download_dataset(
     max_rows = config.get("max_rows", 0)
     max_rows = max_rows if max_rows > 0 else None
 
-    print(f"\n  📥 Downloading: {ds_name}")
+    print(f"\n  [-] Downloading: {ds_name}")
     print(f"     Source: {ds_info['desc']}")
     print(f"     Split: {split}" + (f", max rows: {max_rows:,}" if max_rows else " (all)"))
 
@@ -260,13 +260,13 @@ def download_dataset(
     # Load dataset (streaming to avoid disk usage)
     print(f"     Streaming from HuggingFace ...")
     try:
-        ds = load_dataset(ds_name, split=split, streaming=True, trust_remote_code=True)
+        ds = load_dataset(ds_name, split=split, streaming=True)
     except Exception as e:
         # Try with default config
         try:
             ds = load_dataset(ds_name, split=split, streaming=True)
         except Exception:
-            print(f"     ⚠ Failed to load {ds_name}: {e}")
+            print(f"     [WARN] Failed to load {ds_name}: {e}")
             print(f"     Skipping this source...")
             return {"tokens": 0, "docs": 0, "shards": 0, "skipped": True}
 
@@ -338,9 +338,9 @@ def download_dataset(
                 })
 
     except KeyboardInterrupt:
-        print("\n     ⚠ Interrupted — saving progress...")
+        print("\n     [WARN] Interrupted — saving progress...")
     except Exception as e:
-        print(f"\n     ⚠ Error: {e}")
+        print(f"\n     [WARN] Error: {e}")
     finally:
         pbar.close()
         # Flush remaining buffer
@@ -371,7 +371,7 @@ def download_dataset(
     with open(dataset_output / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"     ✅ Done: {total_docs:,} docs → {total_tokens / 1e6:.0f}M tokens → {len(shard_files)} shards")
+    print(f"     [OK] Done: {total_docs:,} docs → {total_tokens / 1e6:.0f}M tokens → {len(shard_files)} shards")
     return {"tokens": total_tokens, "docs": total_docs, "shards": len(shard_files)}
 
 
@@ -386,10 +386,10 @@ def merge_shards(output_dir: Path, delete_sources: bool = False) -> Path:
     all_bins = [b for b in all_bins if "tokenized" not in str(b)]
 
     if not all_bins:
-        print("  ⚠ No .bin shards found to merge!")
+        print("  [WARN] No .bin shards found to merge!")
         return merged
 
-    print(f"\n  🔗 Merging {len(all_bins)} shards from {len(set(b.parent for b in all_bins))} sources...")
+    print(f"\n  [>] Merging {len(all_bins)} shards from {len(set(b.parent for b in all_bins))} sources...")
 
     for i, bin_path in enumerate(all_bins):
         # Create symlink: tokenized/train_XXXX.bin → source shard
@@ -426,7 +426,7 @@ def merge_shards(output_dir: Path, delete_sources: bool = False) -> Path:
     with open(merged / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
 
-    print(f"  ✅ Merged: {total_tokens / 1e9:.1f}B tokens in {len(all_bins)} shards → {merged}/")
+    print(f"  [OK] Merged: {total_tokens / 1e9:.1f}B tokens in {len(all_bins)} shards → {merged}/")
     return merged
 
 
@@ -532,7 +532,7 @@ Examples:
         return
 
     # ── Check prerequisites ───────────────────────────────────────
-    print("\n  🔍 Checking environment...")
+    print("\n  [*] Checking environment...")
     if not check_deps():
         sys.exit(1)
     check_disk_space(str(output_dir), approx_raw_gb * 1.5)
@@ -551,7 +551,7 @@ Examples:
 
     for dataset_id, cfg in sources.items():
         if dataset_id not in DATASETS:
-            print(f"\n  ⚠ Unknown source '{dataset_id}' — skipping")
+            print(f"\n  [WARN] Unknown source '{dataset_id}' — skipping")
             continue
 
         try:
@@ -566,7 +566,7 @@ Examples:
                 total_tokens += stats["tokens"]
                 total_docs += stats["docs"]
         except Exception as e:
-            print(f"\n  ❌ Failed to download '{dataset_id}': {e}")
+            print(f"\n  [ERR] Failed to download '{dataset_id}': {e}")
             print(f"     Continuing with remaining sources...")
             all_ok = False
 
@@ -578,7 +578,7 @@ Examples:
     # ── Summary ──────────────────────────────────────────────────
     print()
     print("=" * 60)
-    print("  ✅ Download Complete!")
+    print("  [OK] Download Complete!")
     print("=" * 60)
     print(f"  Total docs:    {total_docs:,}")
     print(f"  Total tokens:  {total_tokens / 1e9:.2f}B")

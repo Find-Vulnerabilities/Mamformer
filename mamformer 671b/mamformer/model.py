@@ -221,12 +221,9 @@ class MamformerModel(nn.Module):
             if layer.has_attention and not layer.has_ssm and pending_ssm_h is not None:
                 layer_kwargs["ssm_h_states"] = pending_ssm_h
 
-            if self.gradient_checkpointing and self.training:
-                # NOTE: Gradient checkpointing blocks cross-layer SSM state
-                # propagation. SSM layers inside checkpointed regions cannot
-                # export h_states. This is an inherent memory-quality tradeoff.
-                # For best results with cross_layer mode, disable checkpointing
-                # or checkpoint only attention layers.
+            # Only checkpoint attention layers — SSM layers are cheap (O(N))
+            # and checkpointing them breaks cross-layer SSM state injection.
+            if self.gradient_checkpointing and self.training and layer.has_attention:
                 def make_custom_forward(layer, kwargs):
                     def custom_forward(hidden_states, attention_mask):
                         outputs = layer(
@@ -236,7 +233,7 @@ class MamformerModel(nn.Module):
                             cache=None,
                             **kwargs,
                         )
-                        return outputs[0]  # Return only hidden_states
+                        return outputs[0]
                     return custom_forward
 
                 hidden_states = activation_checkpoint(

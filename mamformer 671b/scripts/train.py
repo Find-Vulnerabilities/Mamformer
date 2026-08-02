@@ -279,7 +279,7 @@ def train(config: dict) -> None:
     # ── Data ───────────────────────────────────────────────────
     dataset = TextDataset(
         data_dir=config.get("data_dir", "./data"),
-        seq_len=config.get("max_seq_len", 8192),
+        seq_len=config.get("max_seq_len", model_config.max_seq_len),
     )
 
     # IterableDataset duplicates data across workers without worker_init_fn.

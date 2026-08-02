@@ -5,11 +5,14 @@ Optimized CUDA/Triton kernels for Mamformer training and inference.
 
 - triton_ssd: Fused selective scan kernel for Mamba-2 (10-50x speedup)
 - flash_attention: Flash Attention 2 integration for GQA/DSA
+- triton_linear_attn: Fused linear attention scan for KDA-Diff
 """
 
 from mamformer.kernels.triton_ssd import (
     triton_ssd_scan,
     triton_selective_scan_fused,
+    triton_linear_attn_scan,
+    triton_linear_attn_scan_single,
     is_triton_available,
 )
 from mamformer.kernels.flash_attention import (
@@ -22,6 +25,8 @@ from mamformer.kernels.flash_attention import (
 __all__ = [
     "triton_ssd_scan",
     "triton_selective_scan_fused",
+    "triton_linear_attn_scan",
+    "triton_linear_attn_scan_single",
     "is_triton_available",
     "flash_attn_gqa",
     "flash_attn_dsa",

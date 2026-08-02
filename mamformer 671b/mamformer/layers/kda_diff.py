@@ -47,6 +47,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mamformer.layers.rope import RotaryEmbedding, apply_rotary_emb
+from mamformer.kernels.triton_ssd import is_triton_available
+
+# Conditional import — only if Triton is available
+if is_triton_available():
+    from mamformer.kernels.triton_ssd import (
+        triton_linear_attn_scan,
+        triton_linear_attn_scan_single,
+    )
+else:
+    triton_linear_attn_scan = None
+    triton_linear_attn_scan_single = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -130,6 +141,9 @@ class LinearDiffAttention(nn.Module):
         use_yarn: bool = False,
         yarn_scale: float = 1.0,
         yarn_original_max_seq_len: int = 8192,
+        use_triton: bool = True,
+        use_compile: bool = False,
+        scan_chunk_size: int = 0,
     ) -> None:
         super().__init__()
 
@@ -141,6 +155,11 @@ class LinearDiffAttention(nn.Module):
         self.n_head_groups = n_heads // n_kv_heads
         self.use_state_injection = use_state_injection
         self.state_injection_dim = state_injection_dim
+
+        # ── Performance flags ──────────────────────────────────
+        self.use_triton = use_triton and is_triton_available()
+        self.use_compile = use_compile
+        self.scan_chunk_size = scan_chunk_size  # 0 = auto-tune
 
         # ── Q projections (two for differential) ────────────────────
         self.q1_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
@@ -249,14 +268,6 @@ class LinearDiffAttention(nn.Module):
         k = k.repeat_interleave(self.n_head_groups, dim=1)
         v = v.repeat_interleave(self.n_head_groups, dim=1)
 
-        # ── Apply kernel feature map ────────────────────────────────
-        q1_phi = kernel_feature_map(q1, self.kernel_dim)  # (B, H, S, K)
-        q2_phi = kernel_feature_map(q2, self.kernel_dim)
-        k_phi = kernel_feature_map(k, self.kernel_dim)
-
-        # For linear attention, values stay in head_dim space
-        # φ(K): (B, H, S, kernel_dim), V: (B, H, S, head_dim)
-
         # ── Handle cached recurrent state ───────────────────────────
         if use_cache and cache is not None:
             S_prev = cache["S"]  # (B, H, kernel_dim, head_dim)
@@ -272,26 +283,28 @@ class LinearDiffAttention(nn.Module):
             )
 
         # ── Linear attention: O(N) computation ──────────────────────
-        # Standard: Output = φ(Q) @ (φ(K)^T @ V) / (φ(Q) @ sum(φ(K)^T))
-        # We compute position-by-position for the recurrent formulation,
-        # but also support parallel training via the parallel form.
-
         if seq_len == 1 and use_cache:
             # Single-step recurrent update (autoregressive inference)
+            q1_phi = kernel_feature_map(q1, self.kernel_dim)
+            q2_phi = kernel_feature_map(q2, self.kernel_dim)
+            k_phi = kernel_feature_map(k, self.kernel_dim)
             attn_output = self._linear_attention_recurrent(
                 q1_phi, q2_phi, k_phi, v, S_prev, z_prev
             )
+        elif self.use_triton and seq_len > 1:
+            # ── Triton fused scan (φ computed inside kernel) ────────
+            attn_output = self._linear_attention_triton(q1, q2, k, v)
+        elif self.use_compile and seq_len > 1:
+            # ── torch.compile wrapped scan ──────────────────────────
+            attn_output = self._compiled_scan(q1, q2, k, v)
         else:
-            # Parallel form (training): compute full sequence at once
-            attn_output = self._linear_attention_parallel(
-                q1_phi, q2_phi, k_phi, v
-            )
+            # ── PyTorch chunked scan (default) ──────────────────────
+            attn_output = self._linear_attention_scan(q1, q2, k, v)
 
         # ── Update recurrent state for next step ────────────────────
         new_cache = None
         if use_cache:
-            # Compute cumulative state over all positions
-            # S = Σ_t k_phi[t]^T @ v[t],  z = Σ_t k_phi[t]^T
+            k_phi = kernel_feature_map(k, self.kernel_dim)
             k_phi_t = k_phi.transpose(-2, -1)  # (B, H, K, S)
             S_new = torch.matmul(k_phi_t, v)  # (B, H, K, head_dim)
             z_new = k_phi_t.sum(dim=-1, keepdim=True)  # (B, H, K, 1)
@@ -314,62 +327,209 @@ class LinearDiffAttention(nn.Module):
         output = self.o_proj(attn_output)
         return output, new_cache
 
-    def _linear_attention_parallel(
+    # ═════════════════════════════════════════════════════════════════
+    # Scan-based linear attention (NO 5D tensor)
+    # ═════════════════════════════════════════════════════════════════
+
+    def _linear_attention_scan(
         self,
-        q1_phi: torch.Tensor,
-        q2_phi: torch.Tensor,
-        k_phi: torch.Tensor,
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        k: torch.Tensor,
         v: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Causal parallel linear attention — optimized with matmul instead of einsum.
+        Chunked scan linear attention — replaces the old 5D cumsum approach.
 
-        Merges (B,H,S) into one batch dimension for cuBLAS-accelerated matmul.
-        Speed: ~10x faster than einsum on H800.
+        OLD (5D, OOM at batch_size=2):
+            kv = bmm(K^T, V) → reshape(B,H,S,K,D) → cumsum(dim=2) → matmul
+            Memory: B * H * S * K * D — 4-8 GB for typical 1B model.
+
+        NEW (scan, batch_size=8+ viable):
+            Split S into chunks of size C (~64-256). Within each chunk,
+            materialize ONLY (B,H,C,K,D) where C << S. Pass a compact
+            (B,H,K,D) state between chunks.
+
+            Memory: B * H * C * K * D — ~64× smaller for S=4096, C=64.
+
+        Algorithm:
+            For chunk c in 0..N:
+              1. Compute φ(K_c), φ(Q1_c), φ(Q2_c) within chunk
+              2. KV_c = φ(K_c)^T ⊗ V_c → cumsum within chunk → (B,H,C,K,D)
+              3. Add prefix state S_state → KV_cum = S_state + KV_c_intra
+              4. o_c = φ(Q_c) @ KV_cum / (φ(Q_c) @ z_cum)
+              5. S_state += Σ(KV_c), z_state += Σ(φ(K_c)^T)
+
+        The intermediate (B,H,C,K,D) tensor with C=64 uses ~67 MB per chunk
+        vs ~4.3 GB for the full (B,H,S,K,D) tensor. Numerically identical
+        to the old approach (modulo fp rounding of cumsum order).
         """
-        B, H, S, K = k_phi.shape
-        D = v.shape[-1]
+        B, H, S, D_full = q1.shape
+        K_dim = self.kernel_dim
 
-        # Merge (B, H, S) → (B*H*S,) for batched matmul
-        q1_f = q1_phi.reshape(B * H * S, 1, K)     # (BHS, 1, K)
-        q2_f = q2_phi.reshape(B * H * S, 1, K)
-        k_f  = k_phi.reshape(B * H * S, K, 1)        # (BHS, K, 1)
-        v_f  = v.reshape(B * H * S, 1, D)            # (BHS, 1, D)
+        # ── Auto-tune chunk size based on available memory ──────────
+        chunk_size = self._resolve_chunk_size(B, H, S, K_dim, D_full)
 
-        # KV = φ(K)^T ⊗ V: (BHS, K, D)
-        kv = torch.bmm(k_f, v_f)
+        # ── Apply kernel feature map ────────────────────────────────
+        # Done once upfront to avoid redundant elu in the loop
+        q1_phi = kernel_feature_map(q1, K_dim)
+        q2_phi = kernel_feature_map(q2, K_dim)
+        k_phi = kernel_feature_map(k, K_dim)
 
-        # Causal cumsum along time dim (need original shape for this)
-        kv_3d = kv.reshape(B, H, S, K, D)
-        kv_cum = torch.cumsum(kv_3d, dim=2).reshape(B * H * S, K, D)
+        # ── State accumulators ──────────────────────────────────────
+        S_state = torch.zeros(B, H, K_dim, D_full, device=q1.device, dtype=q1.dtype)
+        z_state = torch.zeros(B, H, K_dim, 1, device=q1.device, dtype=q1.dtype)
 
-        # z = cumsum(φ(K)^T): (BHS, K, 1)
-        z_3d = k_phi.reshape(B, H, S, K)
-        z_cum_3d = torch.cumsum(z_3d, dim=2).reshape(B * H * S, K, 1)
+        o1_chunks: list[torch.Tensor] = []
+        o2_chunks: list[torch.Tensor] = []
 
-        # out = φ(Q) @ KV_cum: (BHS, 1, D)
-        o1 = torch.bmm(q1_f, kv_cum).squeeze(1)  # (BHS, D)
-        o2 = torch.bmm(q2_f, kv_cum).squeeze(1)
+        for start in range(0, S, chunk_size):
+            end = min(start + chunk_size, S)
+            c_len = end - start
 
-        # norm = φ(Q) @ z_cum: (BHS,)
-        n1 = torch.bmm(q1_f, z_cum_3d).squeeze(-1).squeeze(-1) + 1e-8
-        n2 = torch.bmm(q2_f, z_cum_3d).squeeze(-1).squeeze(-1) + 1e-8
+            # Slice this chunk
+            k_c = k_phi[:, :, start:end, :]     # (B, H, C, K)
+            v_c = v[:, :, start:end, :]          # (B, H, C, D)
+            q1_c = q1_phi[:, :, start:end, :]    # (B, H, C, K)
+            q2_c = q2_phi[:, :, start:end, :]    # (B, H, C, K)
 
-        # Normalize
-        o1 = o1 / n1.unsqueeze(-1)
-        o2 = o2 / n2.unsqueeze(-1)
+            # ── Within-chunk KV outer products ──────────────────────
+            # Flatten (B,H,C) → (B*H*C,) for batched matmul
+            k_c_f = k_c.reshape(B * H * c_len, K_dim, 1)
+            v_c_f = v_c.reshape(B * H * c_len, 1, D_full)
+            kv_c = torch.bmm(k_c_f, v_c_f)  # (B*H*C, K, D)
 
-        # Reshape back
-        o1 = o1.reshape(B, H, S, D)
-        o2 = o2.reshape(B, H, S, D)
+            # Reshape to (B, H, C, K, D) — SMALL: C << S
+            kv_c = kv_c.reshape(B, H, c_len, K_dim, D_full)
 
-        # ── Differential combination ──
+            # ── Within-chunk cumulative sum ─────────────────────────
+            kv_c_cum = torch.cumsum(kv_c, dim=2)  # (B, H, C, K, D)
+
+            # ── Add prefix state from previous chunks ────────────────
+            kv_c_cum = kv_c_cum + S_state.unsqueeze(2)
+
+            # ── Within-chunk K cumsum for normalizer ────────────────
+            k_c_cum = torch.cumsum(k_c, dim=2)  # (B, H, C, K)
+            k_c_cum = k_c_cum + z_state.squeeze(-1).unsqueeze(2)
+
+            # ── Output: φ(Q) @ KV_cum / (φ(Q) @ z_cum) ─────────────
+            kv_c_cum_f = kv_c_cum.reshape(B * H * c_len, K_dim, D_full)
+            q1_c_f = q1_c.reshape(B * H * c_len, 1, K_dim)
+            q2_c_f = q2_c.reshape(B * H * c_len, 1, K_dim)
+
+            o1_c = torch.bmm(q1_c_f, kv_c_cum_f).reshape(B, H, c_len, D_full)
+            o2_c = torch.bmm(q2_c_f, kv_c_cum_f).reshape(B, H, c_len, D_full)
+
+            # ── Normalize ───────────────────────────────────────────
+            k_c_cum_f = k_c_cum.reshape(B * H * c_len, K_dim, 1)
+            n1_c = torch.bmm(q1_c_f, k_c_cum_f).reshape(B, H, c_len)
+            n2_c = torch.bmm(q2_c_f, k_c_cum_f).reshape(B, H, c_len)
+
+            o1_c = o1_c / (n1_c.unsqueeze(-1) + 1e-8)
+            o2_c = o2_c / (n2_c.unsqueeze(-1) + 1e-8)
+
+            o1_chunks.append(o1_c)
+            o2_chunks.append(o2_c)
+
+            # ── Update state for next chunk ─────────────────────────
+            # S_state += sum of KV over this chunk: (B,H,K,D) + (B,H,K,D)
+            S_state = S_state + kv_c.sum(dim=2)
+            # z_state += sum of φ(K)^T over this chunk:
+            #   k_c: (B,H,C,K) → sum over C → (B,H,K) → unsqueeze → (B,H,K,1)
+            z_state = z_state + k_c.sum(dim=2).unsqueeze(-1)
+
+        # ── Concatenate chunks ──────────────────────────────────────
+        o1 = torch.cat(o1_chunks, dim=2)
+        o2 = torch.cat(o2_chunks, dim=2)
+
+        # ── Differential combination ────────────────────────────────
         lam = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
         lam = torch.clamp(lam, max=0.99)
         diff_output = o1 - lam * o2
         diff_output = diff_output / (1.0 - lam + 1e-8)
 
         return diff_output
+
+    def _resolve_chunk_size(
+        self, B: int, H: int, S: int, K_dim: int, D: int
+    ) -> int:
+        """
+        Auto-tune chunk_size so that the per-chunk (B,H,C,K,D) tensor
+        stays under a reasonable memory budget.
+
+        Target: ~500 MB max for the 5D chunk tensor (float32).
+        Floor: 16, Ceiling: 512.
+        """
+        if self.scan_chunk_size > 0:
+            return min(self.scan_chunk_size, S)
+
+        # Target: 128 MB for the chunk tensor
+        bytes_per_element = 4  # float32
+        target_bytes = 128 * 1024 * 1024
+        max_elements = target_bytes // bytes_per_element
+        # B * H * C * K_dim * D ≤ max_elements
+        denom = max(1, B * H * K_dim * D)
+        C = max_elements // denom
+        return max(16, min(512, C, S))
+
+    # ═════════════════════════════════════════════════════════════════
+    # Triton-accelerated scan
+    # ═════════════════════════════════════════════════════════════════
+
+    def _linear_attention_triton(
+        self,
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Triton-fused linear attention scan.
+
+        The kernel fuses: φ(K)→K⊗V→cumsum→φ(Q)@cumsum→norm
+        All in SRAM. No 5D tensor ever materialized in global memory.
+
+        Passes RAW Q, K, V (no φ applied) — the kernel computes
+        φ(x) = elu(x) + 1 internally.
+        """
+        if triton_linear_attn_scan is None:
+            # Fallback to PyTorch scan if Triton not available
+            return self._linear_attention_scan(q1, q2, k, v)
+
+        o1, o2 = triton_linear_attn_scan(
+            q1, q2, k, v,
+            kernel_dim=self.kernel_dim,
+        )
+
+        # ── Differential combination ────────────────────────────────
+        lam = torch.sigmoid(self.lambda_raw).view(1, self.n_heads, 1, 1)
+        lam = torch.clamp(lam, max=0.99)
+        diff_output = o1 - lam * o2
+        diff_output = diff_output / (1.0 - lam + 1e-8)
+
+        return diff_output
+
+    # ═════════════════════════════════════════════════════════════════
+    # torch.compile wrapper
+    # ═════════════════════════════════════════════════════════════════
+
+    @torch.compile(dynamic=True, mode="reduce-overhead")
+    def _compiled_scan(
+        self,
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        torch.compile-wrapped scan.
+
+        Uses dynamic=True to handle varying sequence lengths.
+        This is the same chunked scan but PyTorch 2.0+ can fuse
+        element-wise ops across the chunk loop, and inductor may
+        schedule matmuls more efficiently.
+        """
+        return self._linear_attention_scan(q1, q2, k, v)
 
     def _linear_attention_recurrent(
         self,
@@ -432,10 +592,13 @@ class LinearDiffAttention(nn.Module):
 
     def extra_repr(self) -> str:
         si_info = ", state_injection" if self.use_state_injection else ""
+        triton_info = ", triton" if self.use_triton else ""
+        compile_info = ", compile" if self.use_compile else ""
         return (
             f"d_model={self.d_model}, n_heads={self.n_heads}, "
             f"n_kv_heads={self.n_kv_heads}, head_dim={self.head_dim}, "
             f"kernel_dim={self.kernel_dim}{si_info}"
+            f"{triton_info}{compile_info}, scan"
         )
 
 
@@ -822,6 +985,9 @@ class KDADiffAttention(nn.Module):
         use_yarn: bool = False,
         yarn_scale: float = 1.0,
         yarn_original_max_seq_len: int = 8192,
+        use_triton: bool = True,
+        use_compile: bool = False,
+        scan_chunk_size: int = 0,
     ) -> None:
         super().__init__()
 
@@ -845,7 +1011,11 @@ class KDADiffAttention(nn.Module):
             lambda_init=lambda_init,
             use_state_injection=use_state_injection,
             state_injection_dim=state_injection_dim,
-            dropout=dropout, **rope_kwargs,
+            dropout=dropout,
+            use_triton=use_triton,
+            use_compile=use_compile,
+            scan_chunk_size=scan_chunk_size,
+            **rope_kwargs,
         )
 
         # ── Full attention (O(N²), runs every linear_ratio-th layer) ─

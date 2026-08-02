@@ -10,6 +10,11 @@ Algorithm: Parallel scan over the sequence dimension, leveraging the
 Reference: "Transformers are SSMs" (Dao & Gu, 2024)
            Mamba-2 SSD algorithm (Section 3)
 
+─── Linear Attention Scan Kernel (NEW) ─────────────────────────────────
+Fused φ(K)→K⊗V→cumsum→φ(Q)@cumsum→norm kernel for KDA-Diff linear
+attention. Eliminates the 5D tensor materialization and keeps KV state
+in SRAM throughout the scan.
+
 Usage:
     from mamformer.kernels import triton_ssd_scan, is_triton_available
     if is_triton_available():
@@ -43,7 +48,355 @@ def is_triton_available() -> bool:
     return _triton_available
 
 
-# ── Triton Kernel ────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Triton Linear Attention Scan Kernel (NEW — KDA-Diff optimization)
+# ═══════════════════════════════════════════════════════════════════════════
+
+if is_triton_available():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _linear_attn_scan_kernel(
+        # Input tensors: raw Q1, Q2, K, V (before feature map)
+        q1_ptr, q2_ptr, k_ptr, v_ptr,
+        # Output tensors: o1, o2 (after linear attention)
+        o1_ptr, o2_ptr,
+        # Dimensions
+        B, H, S, K_dim, D,
+        # Strides — Q (same for q1, q2)
+        stride_q_b, stride_q_h, stride_q_s, stride_q_d,
+        # Strides — K
+        stride_k_b, stride_k_h, stride_k_s, stride_k_d,
+        # Strides — V
+        stride_v_b, stride_v_h, stride_v_s, stride_v_d,
+        # Strides — O (same for o1, o2)
+        stride_o_b, stride_o_h, stride_o_s, stride_o_d,
+        # Block sizes
+        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """
+        Fused linear attention scan: φ(K) → K⊗V → cumsum → φ(Q)@cumsum → norm.
+
+        Each program instance processes one (batch, head) pair, scanning over
+        the FULL sequence length. State is maintained in SRAM as:
+          - S_kv: (BLOCK_K, BLOCK_D) — KV accumulator
+          - S_z:  (BLOCK_K, 1)      — normalizer (K sum)
+
+        Arithmetic intensity: ~32K FLOPs per position per head.
+        The kernel is bandwidth-bound; its value is eliminating the 5D tensor
+        from global memory and allowing larger batch sizes.
+
+        Grid: (B * H,) — one program per (batch, head)
+        """
+        pid = tl.program_id(0)
+        batch_idx = pid // H
+        head_idx = pid % H
+
+        # ── State accumulators in SRAM ────────────────────────────────
+        # S_kv: KV accumulator = Σ_{i≤t} φ(k_i)^T ⊗ v_i
+        # S_z:  normalizer     = Σ_{i≤t} φ(k_i)^T
+        S_kv = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
+        S_z = tl.zeros([BLOCK_K, 1], dtype=tl.float32)
+
+        # ── Precompute offset ranges ──────────────────────────────────
+        k_offs = tl.arange(0, BLOCK_K)
+        d_offs = tl.arange(0, BLOCK_D)
+        k_mask = k_offs < K_dim
+        d_mask = d_offs < D
+
+        # ── Base offsets for this (batch, head) ───────────────────────
+        q_base_offset = batch_idx * stride_q_b + head_idx * stride_q_h
+        k_base_offset = batch_idx * stride_k_b + head_idx * stride_k_h
+        v_base_offset = batch_idx * stride_v_b + head_idx * stride_v_h
+        o_base_offset = batch_idx * stride_o_b + head_idx * stride_o_h
+
+        for s in range(S):
+            # ── Load K[s] → φ(K) ──────────────────────────────────
+            k_ptr_s = k_ptr + k_base_offset + s * stride_k_s
+            k_raw = tl.load(
+                k_ptr_s + k_offs * stride_k_d,
+                mask=k_mask, other=0.0
+            ).to(tl.float32)
+
+            # φ(k) = elu(k) + 1  (ensures ≥ 0 for stable normalization)
+            k_phi = tl.where(k_raw > 0.0, k_raw,
+                           tl.exp(tl.minimum(k_raw, 0.0)) - 1.0) + 1.0
+
+            # ── Load V[s] ─────────────────────────────────────────
+            v_ptr_s = v_ptr + v_base_offset + s * stride_v_s
+            v_raw = tl.load(
+                v_ptr_s + d_offs * stride_v_d,
+                mask=d_mask, other=0.0
+            ).to(tl.float32)
+
+            # ── Update state: S_kv += φ(k)^T ⊗ v ──────────────────
+            # Outer product: (K,) ⊗ (D,) → (K, D)
+            S_kv += k_phi[:, None] * v_raw[None, :]
+
+            # ── Update normalizer: S_z += φ(k)^T ───────────────────
+            S_z += k_phi[:, None]
+
+            # ── Load Q1[s], Q2[s] → φ(Q1), φ(Q2) ──────────────────
+            q_ptr_s = q_base_offset + s * stride_q_s
+
+            q1_raw = tl.load(
+                q1_ptr + q_ptr_s + k_offs * stride_q_d,
+                mask=k_mask, other=0.0
+            ).to(tl.float32)
+            q2_raw = tl.load(
+                q2_ptr + q_ptr_s + k_offs * stride_q_d,
+                mask=k_mask, other=0.0
+            ).to(tl.float32)
+
+            # φ(q) = elu(q) + 1
+            q1_phi = tl.where(q1_raw > 0.0, q1_raw,
+                            tl.exp(tl.minimum(q1_raw, 0.0)) - 1.0) + 1.0
+            q2_phi = tl.where(q2_raw > 0.0, q2_raw,
+                            tl.exp(tl.minimum(q2_raw, 0.0)) - 1.0) + 1.0
+
+            # ── Output 1: o1 = φ(q1) @ S_kv / (φ(q1) @ S_z) ───────
+            o1_num = tl.sum(q1_phi[:, None] * S_kv, axis=0)        # (D,)
+            o1_den = tl.sum(q1_phi[:, None] * S_z, axis=0) + 1e-8  # (1,)
+            o1 = o1_num / o1_den
+
+            # ── Output 2: o2 = φ(q2) @ S_kv / (φ(q2) @ S_z) ───────
+            o2_num = tl.sum(q2_phi[:, None] * S_kv, axis=0)        # (D,)
+            o2_den = tl.sum(q2_phi[:, None] * S_z, axis=0) + 1e-8  # (1,)
+            o2 = o2_num / o2_den
+
+            # ── Store outputs ─────────────────────────────────────
+            o_ptr_s = o_base_offset + s * stride_o_s
+
+            tl.store(
+                o1_ptr + o_ptr_s + d_offs * stride_o_d,
+                o1, mask=d_mask
+            )
+            tl.store(
+                o2_ptr + o_ptr_s + d_offs * stride_o_d,
+                o2, mask=d_mask
+            )
+
+
+    @triton.jit
+    def _linear_attn_scan_kernel_fused_q(
+        # Single Q (for when you call twice), otherwise same as above
+        q_ptr, k_ptr, v_ptr,
+        o_ptr,
+        B, H, S, K_dim, D,
+        stride_q_b, stride_q_h, stride_q_s, stride_q_d,
+        stride_k_b, stride_k_h, stride_k_s, stride_k_d,
+        stride_v_b, stride_v_h, stride_v_s, stride_v_d,
+        stride_o_b, stride_o_h, stride_o_s, stride_o_d,
+        BLOCK_K: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        """
+        Single-Q variant: processes one Q projection with shared KV state.
+        Used for inference when only one Q output is needed at a time,
+        or for processing Q1 and Q2 in separate kernel launches (keeps
+        register pressure lower — useful for very large K, D).
+        """
+        pid = tl.program_id(0)
+        batch_idx = pid // H
+        head_idx = pid % H
+
+        S_kv = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
+        S_z = tl.zeros([BLOCK_K, 1], dtype=tl.float32)
+
+        k_offs = tl.arange(0, BLOCK_K)
+        d_offs = tl.arange(0, BLOCK_D)
+        k_mask = k_offs < K_dim
+        d_mask = d_offs < D
+
+        q_base_offset = batch_idx * stride_q_b + head_idx * stride_q_h
+        k_base_offset = batch_idx * stride_k_b + head_idx * stride_k_h
+        v_base_offset = batch_idx * stride_v_b + head_idx * stride_v_h
+        o_base_offset = batch_idx * stride_o_b + head_idx * stride_o_h
+
+        for s in range(S):
+            # ── K → φ(K) ──────────────────────────────────────────
+            k_ptr_s = k_ptr + k_base_offset + s * stride_k_s
+            k_raw = tl.load(
+                k_ptr_s + k_offs * stride_k_d,
+                mask=k_mask, other=0.0
+            ).to(tl.float32)
+            k_phi = tl.where(k_raw > 0.0, k_raw,
+                           tl.exp(tl.minimum(k_raw, 0.0)) - 1.0) + 1.0
+
+            # ── V ─────────────────────────────────────────────────
+            v_ptr_s = v_ptr + v_base_offset + s * stride_v_s
+            v_raw = tl.load(
+                v_ptr_s + d_offs * stride_v_d,
+                mask=d_mask, other=0.0
+            ).to(tl.float32)
+
+            # ── Update accumulators ───────────────────────────────
+            S_kv += k_phi[:, None] * v_raw[None, :]
+            S_z += k_phi[:, None]
+
+            # ── Q → φ(Q) → output ─────────────────────────────────
+            q_ptr_s = q_ptr + q_base_offset + s * stride_q_s
+            q_raw = tl.load(
+                q_ptr_s + k_offs * stride_q_d,
+                mask=k_mask, other=0.0
+            ).to(tl.float32)
+            q_phi = tl.where(q_raw > 0.0, q_raw,
+                           tl.exp(tl.minimum(q_raw, 0.0)) - 1.0) + 1.0
+
+            o_num = tl.sum(q_phi[:, None] * S_kv, axis=0)
+            o_den = tl.sum(q_phi[:, None] * S_z, axis=0) + 1e-8
+            o = o_num / o_den
+
+            o_ptr_s = o_ptr + o_base_offset + s * stride_o_s
+            tl.store(
+                o_ptr_s + d_offs * stride_o_d,
+                o, mask=d_mask
+            )
+
+
+    def triton_linear_attn_scan(
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kernel_dim: int,
+        block_k: int = 128,
+        block_d: int = 128,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Triton-fused linear attention scan for KDA-Diff.
+
+        Fuses all operations in a single kernel launch:
+          1. φ(K) = elu(K) + 1   (feature map)
+          2. S_kv += φ(k_t)^T ⊗ v_t   (KV accumulation)
+          3. S_z  += φ(k_t)^T          (normalizer)
+          4. o1_t = φ(q1_t) @ S_kv / (φ(q1_t) @ S_z)
+          5. o2_t = φ(q2_t) @ S_kv / (φ(q2_t) @ S_z)
+
+        All state stays in SRAM. NO 5D tensor is ever materialized.
+        Peak memory: O(B * H * K * D) instead of O(B * H * S * K * D).
+
+        Args:
+            q1: (batch, n_heads, seq_len, head_dim) — raw Q1 (no φ applied)
+            q2: (batch, n_heads, seq_len, head_dim) — raw Q2 (no φ applied)
+            k:  (batch, n_heads, seq_len, head_dim) — raw K (no φ applied)
+            v:  (batch, n_heads, seq_len, head_dim) — raw V
+            kernel_dim: Feature map output dimension (≤ head_dim)
+            block_k: Triton block size for kernel_dim
+            block_d: Triton block size for head_dim
+
+        Returns:
+            o1: (batch, n_heads, seq_len, head_dim)
+            o2: (batch, n_heads, seq_len, head_dim)
+        """
+        B, H, S, D_full = q1.shape
+        K_dim = min(kernel_dim, D_full)
+
+        # Validate
+        assert k.shape == (B, H, S, D_full), f"K shape {k.shape} != {(B, H, S, D_full)}"
+        assert v.shape == (B, H, S, D_full), f"V shape {v.shape} != {(B, H, S, D_full)}"
+        assert q2.shape == q1.shape
+
+        # Ensure contiguous
+        q1 = q1.contiguous()
+        q2 = q2.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        # Output tensors
+        o1 = torch.empty(B, H, S, D_full, device=q1.device, dtype=q1.dtype)
+        o2 = torch.empty(B, H, S, D_full, device=q1.device, dtype=q1.dtype)
+
+        # Grid: one program per (batch, head)
+        grid = (B * H,)
+
+        # Choose kernel variant
+        # For differential attention, use dual-Q kernel (processes both Q1, Q2
+        # in one pass, reusing the same KV state — saves K,V reloads).
+        _linear_attn_scan_kernel[grid](
+            q1, q2, k, v,
+            o1, o2,
+            B, H, S, K_dim, D_full,
+            q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o1.stride(0), o1.stride(1), o1.stride(2), o1.stride(3),
+            BLOCK_K=max(1, min(block_k, K_dim)),
+            BLOCK_D=max(1, min(block_d, D_full)),
+        )
+
+        return o1, o2
+
+
+    def triton_linear_attn_scan_single(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        kernel_dim: int,
+        block_k: int = 128,
+        block_d: int = 128,
+    ) -> torch.Tensor:
+        """
+        Single-Q variant of the fused linear attention scan.
+
+        Useful for inference or non-differential linear attention.
+        Lower register pressure — better occupancy for large K, D.
+
+        Args:
+            q: (batch, n_heads, seq_len, head_dim) — raw Q
+            k: (batch, n_heads, seq_len, head_dim) — raw K
+            v: (batch, n_heads, seq_len, head_dim) — raw V
+            kernel_dim: Feature map output dimension
+            block_k, block_d: Triton block sizes
+
+        Returns:
+            o: (batch, n_heads, seq_len, head_dim)
+        """
+        B, H, S, D_full = q.shape
+        K_dim = min(kernel_dim, D_full)
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+
+        o = torch.empty(B, H, S, D_full, device=q.device, dtype=q.dtype)
+
+        grid = (B * H,)
+
+        _linear_attn_scan_kernel_fused_q[grid](
+            q, k, v,
+            o,
+            B, H, S, K_dim, D_full,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            BLOCK_K=max(1, min(block_k, K_dim)),
+            BLOCK_D=max(1, min(block_d, D_full)),
+        )
+
+        return o
+
+else:
+    # Triton not available — provide stubs
+    def triton_linear_attn_scan(*args, **kwargs):
+        raise RuntimeError(
+            "Triton is not available. Install with: pip install triton\n"
+            "Or use the PyTorch scan fallback."
+        )
+
+    def triton_linear_attn_scan_single(*args, **kwargs):
+        raise RuntimeError(
+            "Triton is not available. Install with: pip install triton\n"
+            "Or use the PyTorch scan fallback."
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Original Mamba-2 SSD Kernel
+# ═══════════════════════════════════════════════════════════════════════════
 
 if is_triton_available():
     import triton
@@ -199,7 +552,9 @@ else:
         )
 
 
-# ── Fused Triton Kernel (EXPERIMENTAL — DISABLED) ───────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Fused Triton Kernel (EXPERIMENTAL — DISABLED)
+# ═══════════════════════════════════════════════════════════════════════════
 #
 # WARNING: triton_selective_scan_fused is DISABLED by default due to a
 # known correctness bug. DO NOT RE-ENABLE without fixing the issue below.

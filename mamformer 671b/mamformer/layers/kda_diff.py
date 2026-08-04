@@ -143,7 +143,7 @@ class LinearDiffAttention(nn.Module):
         yarn_original_max_seq_len: int = 8192,
         use_triton: bool = True,
         use_compile: bool = False,
-        scan_chunk_size: int = 0,
+        scan_chunk_size: int = 256,
     ) -> None:
         super().__init__()
 
@@ -159,7 +159,22 @@ class LinearDiffAttention(nn.Module):
         # ── Performance flags ──────────────────────────────────
         self.use_triton = use_triton and is_triton_available()
         self.use_compile = use_compile
-        self.scan_chunk_size = scan_chunk_size  # 0 = auto-tune
+        self.scan_chunk_size = scan_chunk_size  # default 256; 0 = auto-tune
+
+        # torch.compile the scan function when use_compile=True
+        # Uses mode="reduce-overhead" for amortized compilation cost.
+        # The compiled function is only called during training (no cache).
+        self._compiled_scan_fn: Optional[callable] = None
+        if self.use_compile:
+            try:
+                self._compiled_scan_fn = torch.compile(
+                    self._linear_attention_scan,
+                    dynamic=True,
+                    mode="reduce-overhead",
+                )
+            except Exception:
+                # torch.compile not available — fall back to eager
+                self._compiled_scan_fn = None
 
         # ── Q projections (two for differential) ────────────────────
         self.q1_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)
@@ -269,7 +284,7 @@ class LinearDiffAttention(nn.Module):
         v = v.repeat_interleave(self.n_head_groups, dim=1)
 
         # ── Handle cached recurrent state ───────────────────────────
-        if use_cache and cache is not None:
+        if use_cache and cache is not None and cache.get("attn_type") == "linear":
             S_prev = cache["S"]  # (B, H, kernel_dim, head_dim)
             z_prev = cache["z"]  # (B, H, kernel_dim, 1)
         else:
@@ -291,14 +306,22 @@ class LinearDiffAttention(nn.Module):
             attn_output = self._linear_attention_recurrent(
                 q1_phi, q2_phi, k_phi, v, S_prev, z_prev
             )
-        elif self.use_triton and seq_len > 1:
+        elif self.use_triton and seq_len > 1 and not use_cache:
             # ── Triton fused scan (φ computed inside kernel) ────────
+            # NOTE: Triton kernel does not support use_cache (the kernel
+            # processes the full sequence internally and doesn't expose
+            # the intermediate KV state needed for autoregressive cache
+            # updates). Force fallback to the PyTorch scan path during
+            # inference so the recurrent state is correctly maintained.
             attn_output = self._linear_attention_triton(q1, q2, k, v)
-        elif self.use_compile and seq_len > 1:
-            # ── torch.compile wrapped scan ──────────────────────────
-            attn_output = self._compiled_scan(q1, q2, k, v)
+        elif self._compiled_scan_fn is not None and seq_len > 1 and not use_cache:
+            # ── torch.compile-optimized scan ────────────────────────
+            # torch.compile fuses element-wise ops and optimizes matmul
+            # scheduling across the chunk loop. Only active during
+            # training (no cache) to avoid graph breaks.
+            attn_output = self._compiled_scan_fn(q1, q2, k, v)
         else:
-            # ── PyTorch chunked scan (default) ──────────────────────
+            # ── PyTorch chunked scan (default / inference fallback) ──
             attn_output = self._linear_attention_scan(q1, q2, k, v)
 
         # ── Update recurrent state for next step ────────────────────
@@ -312,7 +335,7 @@ class LinearDiffAttention(nn.Module):
             S = S_prev + S_new
             z = z_prev + z_new
 
-            new_cache = {"S": S, "z": z}
+            new_cache = {"S": S, "z": z, "attn_type": "linear"}
 
         # ── Reshape and output projection ───────────────────────────
         attn_output = attn_output.transpose(1, 2).contiguous().view(
@@ -370,15 +393,19 @@ class LinearDiffAttention(nn.Module):
         # ── Auto-tune chunk size based on available memory ──────────
         chunk_size = self._resolve_chunk_size(B, H, S, K_dim, D_full)
 
+        # ── Compute dtype: bf16 for intermediates (saves ~30% VRAM),
+        #     float32 for state accumulators (numerical stability).
+        compute_dtype = torch.bfloat16 if q1.dtype == torch.float32 else q1.dtype
+
         # ── Apply kernel feature map ────────────────────────────────
         # Done once upfront to avoid redundant elu in the loop
-        q1_phi = kernel_feature_map(q1, K_dim)
-        q2_phi = kernel_feature_map(q2, K_dim)
-        k_phi = kernel_feature_map(k, K_dim)
+        q1_phi = kernel_feature_map(q1, K_dim).to(compute_dtype)
+        q2_phi = kernel_feature_map(q2, K_dim).to(compute_dtype)
+        k_phi = kernel_feature_map(k, K_dim).to(compute_dtype)
 
-        # ── State accumulators ──────────────────────────────────────
-        S_state = torch.zeros(B, H, K_dim, D_full, device=q1.device, dtype=q1.dtype)
-        z_state = torch.zeros(B, H, K_dim, 1, device=q1.device, dtype=q1.dtype)
+        # ── State accumulators (float32 for stable prefix sums) ─────
+        S_state = torch.zeros(B, H, K_dim, D_full, device=q1.device, dtype=torch.float32)
+        z_state = torch.zeros(B, H, K_dim, 1, device=q1.device, dtype=torch.float32)
 
         o1_chunks: list[torch.Tensor] = []
         o2_chunks: list[torch.Tensor] = []
@@ -387,9 +414,9 @@ class LinearDiffAttention(nn.Module):
             end = min(start + chunk_size, S)
             c_len = end - start
 
-            # Slice this chunk
+            # Slice this chunk (in compute_dtype for memory efficiency)
             k_c = k_phi[:, :, start:end, :]     # (B, H, C, K)
-            v_c = v[:, :, start:end, :]          # (B, H, C, D)
+            v_c = v[:, :, start:end, :].to(compute_dtype)  # (B, H, C, D)
             q1_c = q1_phi[:, :, start:end, :]    # (B, H, C, K)
             q2_c = q2_phi[:, :, start:end, :]    # (B, H, C, K)
 
@@ -405,12 +432,12 @@ class LinearDiffAttention(nn.Module):
             # ── Within-chunk cumulative sum ─────────────────────────
             kv_c_cum = torch.cumsum(kv_c, dim=2)  # (B, H, C, K, D)
 
-            # ── Add prefix state from previous chunks ────────────────
-            kv_c_cum = kv_c_cum + S_state.unsqueeze(2)
+            # ── Add prefix state from previous chunks (fp32 for accuracy) ──
+            kv_c_cum = kv_c_cum + S_state.unsqueeze(2).to(compute_dtype)
 
             # ── Within-chunk K cumsum for normalizer ────────────────
             k_c_cum = torch.cumsum(k_c, dim=2)  # (B, H, C, K)
-            k_c_cum = k_c_cum + z_state.squeeze(-1).unsqueeze(2)
+            k_c_cum = k_c_cum + z_state.squeeze(-1).unsqueeze(2).to(compute_dtype)
 
             # ── Output: φ(Q) @ KV_cum / (φ(Q) @ z_cum) ─────────────
             kv_c_cum_f = kv_c_cum.reshape(B * H * c_len, K_dim, D_full)
@@ -428,15 +455,15 @@ class LinearDiffAttention(nn.Module):
             o1_c = o1_c / (n1_c.unsqueeze(-1) + 1e-8)
             o2_c = o2_c / (n2_c.unsqueeze(-1) + 1e-8)
 
-            o1_chunks.append(o1_c)
-            o2_chunks.append(o2_c)
+            # Cast outputs back to model dtype
+            o1_chunks.append(o1_c.to(q1.dtype))
+            o2_chunks.append(o2_c.to(q1.dtype))
 
-            # ── Update state for next chunk ─────────────────────────
-            # S_state += sum of KV over this chunk: (B,H,K,D) + (B,H,K,D)
-            S_state = S_state + kv_c.sum(dim=2)
-            # z_state += sum of φ(K)^T over this chunk:
-            #   k_c: (B,H,C,K) → sum over C → (B,H,K) → unsqueeze → (B,H,K,1)
-            z_state = z_state + k_c.sum(dim=2).unsqueeze(-1)
+            # ── Update state for next chunk (fp32 accumulation) ─────
+            # S_state += sum of KV over this chunk
+            S_state = S_state + kv_c.sum(dim=2).to(torch.float32)
+            # z_state += sum of φ(K)^T over this chunk
+            z_state = z_state + k_c.sum(dim=2).unsqueeze(-1).to(torch.float32)
 
         # ── Concatenate chunks ──────────────────────────────────────
         o1 = torch.cat(o1_chunks, dim=2)
@@ -454,20 +481,23 @@ class LinearDiffAttention(nn.Module):
         self, B: int, H: int, S: int, K_dim: int, D: int
     ) -> int:
         """
-        Auto-tune chunk_size so that the per-chunk (B,H,C,K,D) tensor
-        stays under a reasonable memory budget.
+        Resolve chunk_size for the scan loop.
 
-        Target: ~500 MB max for the 5D chunk tensor (float32).
+        Default: fixed 256 — good balance between memory and kernel
+        launch overhead on H800/A100 GPUs. Each chunk processes 256
+        positions with a per-chunk (B,H,C,K,D) tensor.
+
+        When set to 0: auto-tune based on available memory budget
+        (Target: ~128 MB for the chunk tensor, float32).
         Floor: 16, Ceiling: 512.
         """
         if self.scan_chunk_size > 0:
             return min(self.scan_chunk_size, S)
 
-        # Target: 128 MB for the chunk tensor
+        # Auto-tune fallback (only when scan_chunk_size=0)
         bytes_per_element = 4  # float32
         target_bytes = 128 * 1024 * 1024
         max_elements = target_bytes // bytes_per_element
-        # B * H * C * K_dim * D ≤ max_elements
         denom = max(1, B * H * K_dim * D)
         C = max_elements // denom
         return max(16, min(512, C, S))
@@ -782,12 +812,12 @@ class FullDiffAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
 
         # ── KV Cache (store compressed latent for efficiency) ──────
-        if use_cache and cache is not None:
+        if use_cache and cache is not None and cache.get("attn_type") == "full":
             k = torch.cat([cache["k"], k], dim=2)
             v = torch.cat([cache["v"], v], dim=2)
 
         # For caching, store the decompressed K, V (not latent)
-        new_cache = {"k": k, "v": v} if use_cache else None
+        new_cache = {"k": k, "v": v, "attn_type": "full"} if use_cache else None
 
         # ── Repeat KV for GQA ─────────────────────────────────────
         k = k.repeat_interleave(self.n_head_groups, dim=1)
@@ -987,7 +1017,7 @@ class KDADiffAttention(nn.Module):
         yarn_original_max_seq_len: int = 8192,
         use_triton: bool = True,
         use_compile: bool = False,
-        scan_chunk_size: int = 0,
+        scan_chunk_size: int = 256,
     ) -> None:
         super().__init__()
 
@@ -1090,15 +1120,20 @@ class KDADiffAttention(nn.Module):
 
             # Threshold: >0.5 → use full attention, else linear
             if avg_ratio > 0.5:
+                # Guard: if cache came from linear attention (keys "S"/"z"),
+                # it's incompatible with full attention (keys "k"/"v").
+                # Discard the stale cache so FullDiffAttention starts fresh.
+                safe_cache = cache if (cache is None or cache.get("attn_type") == "full") else None
                 output, new_cache = self.full_attn(
                     x, attention_mask=attention_mask,
-                    use_cache=use_cache, cache=cache,
+                    use_cache=use_cache, cache=safe_cache,
                     h_states=h_states,
                 )
             else:
+                safe_cache = cache if (cache is None or cache.get("attn_type") == "linear") else None
                 output, new_cache = self.linear_attn(
                     x, attention_mask=attention_mask,
-                    use_cache=use_cache, cache=cache,
+                    use_cache=use_cache, cache=safe_cache,
                     h_states=h_states,
                 )
 

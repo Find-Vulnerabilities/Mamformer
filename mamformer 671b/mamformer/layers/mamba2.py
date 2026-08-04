@@ -62,6 +62,22 @@ def selective_scan(
         y: Output tensor (batch, seqlen, d_inner)
         (plus h_states and/or final_state as requested)
     """
+    return _selective_scan_impl(
+        x, dt, A, B, C, D, return_h_states, return_final_state
+    )
+
+
+def _selective_scan_impl(
+    x: torch.Tensor,
+    dt: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    return_h_states: bool = False,
+    return_final_state: bool = False,
+):
+    """Eager implementation of selective_scan. See selective_scan for docs."""
     batch, seqlen, d_inner = x.shape
     d_state = A.shape[0]
 
@@ -114,6 +130,26 @@ def selective_scan(
     return tuple(result)
 
 
+# torch.compile wrapper for the selective scan — used during training
+# to fuse element-wise ops and optimize the recurrence loop.
+_compiled_selective_scan = None
+
+def _get_compiled_selective_scan():
+    """Lazily create the torch.compile'd version of selective_scan."""
+    global _compiled_selective_scan
+    if _compiled_selective_scan is None:
+        try:
+            _compiled_selective_scan = torch.compile(
+                _selective_scan_impl,
+                dynamic=True,
+                mode="reduce-overhead",
+            )
+        except Exception:
+            # torch.compile not available — fall back to eager
+            _compiled_selective_scan = _selective_scan_impl
+    return _compiled_selective_scan
+
+
 class Mamba2Block(nn.Module):
     """
     Mamba-2 SSM block for use within the hybrid Mamformer architecture.
@@ -141,6 +177,7 @@ class Mamba2Block(nn.Module):
         expand: int = 1,
         dt_rank: Optional[int] = None,
         bias: bool = False,
+        use_compile: bool = False,
     ) -> None:
         super().__init__()
 
@@ -148,9 +185,10 @@ class Mamba2Block(nn.Module):
         self.d_inner = d_model * expand
         self.d_state = d_state
         self.d_conv = d_conv
+        self.use_compile = use_compile
 
-        # dt_rank: by default ceil(d_model / 16)
-        self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 16)
+        # dt_rank: by default ceil(d_model / 32) — reduced from /16 to save VRAM
+        self.dt_rank = dt_rank if dt_rank is not None else math.ceil(d_model / 32)
 
         # Input projection: d_model → 2 * d_inner (x and z branches)
         self.in_proj = nn.Linear(d_model, 2 * self.d_inner, bias=bias)
@@ -266,7 +304,9 @@ class Mamba2Block(nn.Module):
             dt = F.softplus(self.dt_proj(x_act))
             B = self.B_proj(x_act)
             C = self.C_proj(x_act)
-            scan_result = selective_scan(
+            # Use torch.compile'd scan during training for automatic fusion
+            scan_fn = _get_compiled_selective_scan() if self.use_compile else selective_scan
+            scan_result = scan_fn(
                 x=x_act, dt=dt, A=self.A_log, B=B, C=C, D=self.D,
                 return_h_states=False, return_final_state=use_cache,
             )

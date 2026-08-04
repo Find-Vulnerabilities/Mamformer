@@ -75,30 +75,26 @@ if is_triton_available():
         # Block sizes
         BLOCK_K: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        GROUP_H: tl.constexpr,
     ):
         """
         Fused linear attention scan: φ(K) → K⊗V → cumsum → φ(Q)@cumsum → norm.
 
-        Each program instance processes one (batch, head) pair, scanning over
-        the FULL sequence length. State is maintained in SRAM as:
+        Each program processes GROUP_H heads for one batch element, scanning
+        over the FULL sequence length per head. State is maintained in SRAM:
           - S_kv: (BLOCK_K, BLOCK_D) — KV accumulator
           - S_z:  (BLOCK_K, 1)      — normalizer (K sum)
 
-        Arithmetic intensity: ~32K FLOPs per position per head.
-        The kernel is bandwidth-bound; its value is eliminating the 5D tensor
-        from global memory and allowing larger batch sizes.
+        Heads are processed sequentially within a program — no inter-head
+        state sharing, but this amortizes kernel launch overhead and
+        improves SM occupancy on large GPUs (H800/A100).
 
-        Grid: (B * H,) — one program per (batch, head)
+        Grid: (B * H // GROUP_H,) — one program per (batch, head_group)
         """
         pid = tl.program_id(0)
-        batch_idx = pid // H
-        head_idx = pid % H
-
-        # ── State accumulators in SRAM ────────────────────────────────
-        # S_kv: KV accumulator = Σ_{i≤t} φ(k_i)^T ⊗ v_i
-        # S_z:  normalizer     = Σ_{i≤t} φ(k_i)^T
-        S_kv = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
-        S_z = tl.zeros([BLOCK_K, 1], dtype=tl.float32)
+        n_head_groups = H // GROUP_H
+        batch_idx = pid // n_head_groups
+        head_group = pid % n_head_groups
 
         # ── Precompute offset ranges ──────────────────────────────────
         k_offs = tl.arange(0, BLOCK_K)
@@ -106,77 +102,83 @@ if is_triton_available():
         k_mask = k_offs < K_dim
         d_mask = d_offs < D
 
-        # ── Base offsets for this (batch, head) ───────────────────────
-        q_base_offset = batch_idx * stride_q_b + head_idx * stride_q_h
-        k_base_offset = batch_idx * stride_k_b + head_idx * stride_k_h
-        v_base_offset = batch_idx * stride_v_b + head_idx * stride_v_h
-        o_base_offset = batch_idx * stride_o_b + head_idx * stride_o_h
+        # ── Loop over heads in this group ─────────────────────────────
+        for h_offset in range(GROUP_H):
+            head_idx = head_group * GROUP_H + h_offset
+            if head_idx >= H:
+                continue  # Guard for non-divisible H
 
-        for s in range(S):
-            # ── Load K[s] → φ(K) ──────────────────────────────────
-            k_ptr_s = k_ptr + k_base_offset + s * stride_k_s
-            k_raw = tl.load(
-                k_ptr_s + k_offs * stride_k_d,
-                mask=k_mask, other=0.0
-            ).to(tl.float32)
+            # ── State accumulators (reset per head) ───────────────────
+            S_kv = tl.zeros([BLOCK_K, BLOCK_D], dtype=tl.float32)
+            S_z = tl.zeros([BLOCK_K, 1], dtype=tl.float32)
 
-            # φ(k) = elu(k) + 1  (ensures ≥ 0 for stable normalization)
-            k_phi = tl.where(k_raw > 0.0, k_raw,
-                           tl.exp(tl.minimum(k_raw, 0.0)) - 1.0) + 1.0
+            # ── Base offsets for this (batch, head) ───────────────────
+            q_base_offset = batch_idx * stride_q_b + head_idx * stride_q_h
+            k_base_offset = batch_idx * stride_k_b + head_idx * stride_k_h
+            v_base_offset = batch_idx * stride_v_b + head_idx * stride_v_h
+            o_base_offset = batch_idx * stride_o_b + head_idx * stride_o_h
 
-            # ── Load V[s] ─────────────────────────────────────────
-            v_ptr_s = v_ptr + v_base_offset + s * stride_v_s
-            v_raw = tl.load(
-                v_ptr_s + d_offs * stride_v_d,
-                mask=d_mask, other=0.0
-            ).to(tl.float32)
+            for s in range(S):
+                # ── Load K[s] → φ(K) ──────────────────────────────
+                k_ptr_s = k_ptr + k_base_offset + s * stride_k_s
+                k_raw = tl.load(
+                    k_ptr_s + k_offs * stride_k_d,
+                    mask=k_mask, other=0.0
+                ).to(tl.float32)
 
-            # ── Update state: S_kv += φ(k)^T ⊗ v ──────────────────
-            # Outer product: (K,) ⊗ (D,) → (K, D)
-            S_kv += k_phi[:, None] * v_raw[None, :]
+                # φ(k) = elu(k) + 1  (matches PyTorch: F.elu + 1)
+                k_phi = tl.where(k_raw > 0.0, k_raw + 1.0, tl.exp(k_raw))
 
-            # ── Update normalizer: S_z += φ(k)^T ───────────────────
-            S_z += k_phi[:, None]
+                # ── Load V[s] ─────────────────────────────────────
+                v_ptr_s = v_ptr + v_base_offset + s * stride_v_s
+                v_raw = tl.load(
+                    v_ptr_s + d_offs * stride_v_d,
+                    mask=d_mask, other=0.0
+                ).to(tl.float32)
 
-            # ── Load Q1[s], Q2[s] → φ(Q1), φ(Q2) ──────────────────
-            q_ptr_s = q_base_offset + s * stride_q_s
+                # ── Update state: S_kv += φ(k)^T ⊗ v ──────────────
+                S_kv += k_phi[:, None] * v_raw[None, :]
 
-            q1_raw = tl.load(
-                q1_ptr + q_ptr_s + k_offs * stride_q_d,
-                mask=k_mask, other=0.0
-            ).to(tl.float32)
-            q2_raw = tl.load(
-                q2_ptr + q_ptr_s + k_offs * stride_q_d,
-                mask=k_mask, other=0.0
-            ).to(tl.float32)
+                # ── Update normalizer: S_z += φ(k)^T ───────────────
+                S_z += k_phi[:, None]
 
-            # φ(q) = elu(q) + 1
-            q1_phi = tl.where(q1_raw > 0.0, q1_raw,
-                            tl.exp(tl.minimum(q1_raw, 0.0)) - 1.0) + 1.0
-            q2_phi = tl.where(q2_raw > 0.0, q2_raw,
-                            tl.exp(tl.minimum(q2_raw, 0.0)) - 1.0) + 1.0
+                # ── Load Q1[s], Q2[s] → φ(Q1), φ(Q2) ──────────────
+                q_ptr_s = q_base_offset + s * stride_q_s
 
-            # ── Output 1: o1 = φ(q1) @ S_kv / (φ(q1) @ S_z) ───────
-            o1_num = tl.sum(q1_phi[:, None] * S_kv, axis=0)        # (D,)
-            o1_den = tl.sum(q1_phi[:, None] * S_z, axis=0) + 1e-8  # (1,)
-            o1 = o1_num / o1_den
+                q1_raw = tl.load(
+                    q1_ptr + q_ptr_s + k_offs * stride_q_d,
+                    mask=k_mask, other=0.0
+                ).to(tl.float32)
+                q2_raw = tl.load(
+                    q2_ptr + q_ptr_s + k_offs * stride_q_d,
+                    mask=k_mask, other=0.0
+                ).to(tl.float32)
 
-            # ── Output 2: o2 = φ(q2) @ S_kv / (φ(q2) @ S_z) ───────
-            o2_num = tl.sum(q2_phi[:, None] * S_kv, axis=0)        # (D,)
-            o2_den = tl.sum(q2_phi[:, None] * S_z, axis=0) + 1e-8  # (1,)
-            o2 = o2_num / o2_den
+                # φ(q) = elu(q) + 1  (matches PyTorch: F.elu + 1)
+                q1_phi = tl.where(q1_raw > 0.0, q1_raw + 1.0, tl.exp(q1_raw))
+                q2_phi = tl.where(q2_raw > 0.0, q2_raw + 1.0, tl.exp(q2_raw))
 
-            # ── Store outputs ─────────────────────────────────────
-            o_ptr_s = o_base_offset + s * stride_o_s
+                # ── Output 1: o1 = φ(q1) @ S_kv / (φ(q1) @ S_z) ───
+                o1_num = tl.sum(q1_phi[:, None] * S_kv, axis=0)
+                o1_den = tl.sum(q1_phi[:, None] * S_z, axis=0) + 1e-8
+                o1 = o1_num / o1_den
 
-            tl.store(
-                o1_ptr + o_ptr_s + d_offs * stride_o_d,
-                o1, mask=d_mask
-            )
-            tl.store(
-                o2_ptr + o_ptr_s + d_offs * stride_o_d,
-                o2, mask=d_mask
-            )
+                # ── Output 2: o2 = φ(q2) @ S_kv / (φ(q2) @ S_z) ───
+                o2_num = tl.sum(q2_phi[:, None] * S_kv, axis=0)
+                o2_den = tl.sum(q2_phi[:, None] * S_z, axis=0) + 1e-8
+                o2 = o2_num / o2_den
+
+                # ── Store outputs ─────────────────────────────────
+                o_ptr_s = o_base_offset + s * stride_o_s
+
+                tl.store(
+                    o1_ptr + o_ptr_s + d_offs * stride_o_d,
+                    o1, mask=d_mask
+                )
+                tl.store(
+                    o2_ptr + o_ptr_s + d_offs * stride_o_d,
+                    o2, mask=d_mask
+                )
 
 
     @triton.jit
@@ -222,8 +224,8 @@ if is_triton_available():
                 k_ptr_s + k_offs * stride_k_d,
                 mask=k_mask, other=0.0
             ).to(tl.float32)
-            k_phi = tl.where(k_raw > 0.0, k_raw,
-                           tl.exp(tl.minimum(k_raw, 0.0)) - 1.0) + 1.0
+            # φ(k) = elu(k) + 1  (matches PyTorch: F.elu(x) + 1.0)
+            k_phi = tl.where(k_raw > 0.0, k_raw + 1.0, tl.exp(k_raw))
 
             # ── V ─────────────────────────────────────────────────
             v_ptr_s = v_ptr + v_base_offset + s * stride_v_s
@@ -242,8 +244,7 @@ if is_triton_available():
                 q_ptr_s + k_offs * stride_q_d,
                 mask=k_mask, other=0.0
             ).to(tl.float32)
-            q_phi = tl.where(q_raw > 0.0, q_raw,
-                           tl.exp(tl.minimum(q_raw, 0.0)) - 1.0) + 1.0
+            q_phi = tl.where(q_raw > 0.0, q_raw + 1.0, tl.exp(q_raw))
 
             o_num = tl.sum(q_phi[:, None] * S_kv, axis=0)
             o_den = tl.sum(q_phi[:, None] * S_z, axis=0) + 1e-8
@@ -264,6 +265,7 @@ if is_triton_available():
         kernel_dim: int,
         block_k: int = 128,
         block_d: int = 128,
+        group_h: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Triton-fused linear attention scan for KDA-Diff.
@@ -278,6 +280,9 @@ if is_triton_available():
         All state stays in SRAM. NO 5D tensor is ever materialized.
         Peak memory: O(B * H * K * D) instead of O(B * H * S * K * D).
 
+        Each Triton block processes GROUP_H heads sequentially, improving
+        SM occupancy by increasing work-per-block on large GPUs.
+
         Args:
             q1: (batch, n_heads, seq_len, head_dim) — raw Q1 (no φ applied)
             q2: (batch, n_heads, seq_len, head_dim) — raw Q2 (no φ applied)
@@ -286,6 +291,7 @@ if is_triton_available():
             kernel_dim: Feature map output dimension (≤ head_dim)
             block_k: Triton block size for kernel_dim
             block_d: Triton block size for head_dim
+            group_h: Heads per Triton block (0 = auto: 4 for H>=32, else 1)
 
         Returns:
             o1: (batch, n_heads, seq_len, head_dim)
@@ -299,6 +305,19 @@ if is_triton_available():
         assert v.shape == (B, H, S, D_full), f"V shape {v.shape} != {(B, H, S, D_full)}"
         assert q2.shape == q1.shape
 
+        # Auto-select group_h: 4 heads/block for large models, 1 for small
+        if group_h <= 0:
+            if H >= 32:
+                group_h = 4
+            elif H >= 16:
+                group_h = 2
+            else:
+                group_h = 1
+        # Ensure group_h divides H evenly (or clamp)
+        while H % group_h != 0 and group_h > 1:
+            group_h -= 1
+        group_h = max(1, group_h)
+
         # Ensure contiguous
         q1 = q1.contiguous()
         q2 = q2.contiguous()
@@ -309,8 +328,8 @@ if is_triton_available():
         o1 = torch.empty(B, H, S, D_full, device=q1.device, dtype=q1.dtype)
         o2 = torch.empty(B, H, S, D_full, device=q1.device, dtype=q1.dtype)
 
-        # Grid: one program per (batch, head)
-        grid = (B * H,)
+        # Grid: one program per (batch, head_group) where each group = GROUP_H heads
+        grid = (B * (H // group_h),)
 
         # Choose kernel variant
         # For differential attention, use dual-Q kernel (processes both Q1, Q2
@@ -325,6 +344,7 @@ if is_triton_available():
             o1.stride(0), o1.stride(1), o1.stride(2), o1.stride(3),
             BLOCK_K=max(1, min(block_k, K_dim)),
             BLOCK_D=max(1, min(block_d, D_full)),
+            GROUP_H=group_h,
         )
 
         return o1, o2

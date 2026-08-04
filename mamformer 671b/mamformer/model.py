@@ -47,6 +47,30 @@ from mamformer.layers.mtp import MultiTokenPredictor
 from mamformer.generation import GenerationMixin
 
 
+def _is_full_attention_checkpointable(layer: "MamformerBlock") -> bool:
+    """
+    Check if a layer's attention module should be gradient-checkpointed.
+
+    Only FullDiffAttention (O(N²)) layers benefit from checkpointing —
+    they materialize large attention matrices that dominate VRAM.
+    LinearDiffAttention (O(N)) layers are cheap and skipping them
+    avoids unnecessary recomputation overhead.
+
+    For non-KDA-Diff attention (GQA/DSA), checkpoint all attention layers
+    since they are all O(N²).
+    """
+    attn = getattr(layer, 'attention', None)
+    if attn is None:
+        return False
+
+    # KDA-Diff: only checkpoint FullDiffAttention layers (every 4th)
+    if hasattr(attn, '_is_full_attention_layer'):
+        return attn._is_full_attention_layer()
+
+    # DSA / GQA: checkpoint all attention layers (all are O(N²))
+    return True
+
+
 class MamformerModel(nn.Module):
     """
     The core Mamformer transformer model — a stack of hybrid blocks.
@@ -221,9 +245,17 @@ class MamformerModel(nn.Module):
             if layer.has_attention and not layer.has_ssm and pending_ssm_h is not None:
                 layer_kwargs["ssm_h_states"] = pending_ssm_h
 
-            # Only checkpoint attention layers — SSM layers are cheap (O(N))
-            # and checkpointing them breaks cross-layer SSM state injection.
-            if self.gradient_checkpointing and self.training and layer.has_attention:
+            # Only checkpoint FullDiffAttention layers (O(N²), every 4th attn layer).
+            # LinearDiffAttention (O(N)) and SSM layers are cheap and don't need
+            # checkpointing — checkpointing SSM layers also breaks cross-layer
+            # SSM state injection.
+            _needs_checkpoint = (
+                self.gradient_checkpointing
+                and self.training
+                and layer.has_attention
+                and _is_full_attention_checkpointable(layer)
+            )
+            if _needs_checkpoint:
                 def make_custom_forward(layer, kwargs):
                     def custom_forward(hidden_states, attention_mask):
                         outputs = layer(

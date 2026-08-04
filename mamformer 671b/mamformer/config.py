@@ -412,7 +412,7 @@ class MamformerConfig:
             raise ValueError(f"d_ff ({self.d_ff}) must be positive")
 
         if isinstance(self.mamba, MambaConfig) and self.mamba.dt_rank == "auto":
-            self.mamba.dt_rank = math.ceil(self.d_model / 16)
+            self.mamba.dt_rank = math.ceil(self.d_model / 32)
 
         # Sync GenerationConfig.max_context with max_seq_len
         if self.generation.max_context == 8192 and self.max_seq_len != 8192:
